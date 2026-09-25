@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
 import { Activity, ArrowRight, ArrowUpRight, Pause, Play, RefreshCw, RotateCcw } from "lucide-react";
 import { Switch } from "@/components/ui/switch";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -11,26 +11,31 @@ import {
   AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle, AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
 import {
-  defaultUniverse, defaults, emptyMarkets, feeKey, money, newSession, pct, price, routesFor, signedMoney, supportedPair, symbols, venues,
+  defaultUniverse, defaults, emptyMarkets, feeKey, money, newSession, pct, price, routesFor, settingRange, signedMoney, supportedPair, symbols, venues,
   type PublicFeesResponse, type Quote, type Session, type Settings, type Snapshot, type SymbolName, type Universe, type Venue,
 } from "@/lib/market";
 import { connectMarketStreams } from "@/lib/streams";
-import { publicFeeSources } from "@/lib/public-fees";
+import { feeScheduleLinks, publicFeeSources } from "@/lib/public-fees";
 
-function loadSettings(): Settings {
+function loadSettings(manualFees: Venue[]): Settings {
   try {
     const current = localStorage.getItem("arbiter-settings-v2");
     const saved = JSON.parse(current || localStorage.getItem("arbiter-settings-v1") || "null");
     if (!saved) return defaults;
     return Object.fromEntries(Object.entries(defaults).map(([key, value]) => {
+      // Only manual overrides keep a saved fee, so corrected default estimates reach returning visitors.
+      const venue = venues.find((item) => feeKey[item] === key);
+      if (venue && !manualFees.includes(venue)) return [key, value];
       const n = Number(saved[key]);
-      const max = key === "budget" ? 100000 : key === "minNet" ? 10000 : 10;
-      // The previous baseline used 0.4% for Kraken; the published entry taker tier is 0.8%.
-      if (!current && key === "krakenFee" && n === 0.4) return [key, 0.8];
-      if (!current && key === "bitflyerFee" && n === 0.5) return [key, 0.1];
-      return [key, Number.isFinite(n) && n >= 0 && n <= max ? n : value];
+      const [min, max] = settingRange(key as keyof Settings);
+      return [key, Number.isFinite(n) && n >= min && n <= max ? n : value];
     })) as Settings;
   } catch { return defaults; }
+}
+function parseSetting(key: keyof Settings, raw: string): number | null {
+  const value = Number(raw);
+  const [min, max] = settingRange(key);
+  return raw.trim() !== "" && Number.isFinite(value) && value >= min && value <= max ? value : null;
 }
 function loadFeeOverrides(): Venue[] {
   try {
@@ -80,6 +85,7 @@ export default function Home() {
   const [feeError, setFeeError] = useState("");
   const [feeLoading, setFeeLoading] = useState(false);
   const [manualFees, setManualFees] = useState<Venue[]>([]);
+  const [drafts, setDrafts] = useState<Partial<Record<keyof Settings, string>>>({});
   const inFlight = useRef(false);
   const runningRef = useRef(false);
   const settingsRef = useRef(settings);
@@ -105,7 +111,7 @@ export default function Home() {
   }, [settings, feeSnapshot, manualFees]);
 
   // eslint-disable-next-line react-hooks/set-state-in-effect -- localStorage is read after hydration so server and client markup match.
-  useEffect(() => { setSettings(loadSettings()); setUniverse(loadUniverse()); setSession(loadSession()); setManualFees(loadFeeOverrides()); setHydrated(true); }, []);
+  useEffect(() => { const manual = loadFeeOverrides(); setSettings(loadSettings(manual)); setUniverse(loadUniverse()); setSession(loadSession()); setManualFees(manual); setHydrated(true); }, []);
   useEffect(() => { if (hydrated) localStorage.setItem("arbiter-settings-v2", JSON.stringify(settings)); }, [settings, hydrated]);
   useEffect(() => { if (hydrated) localStorage.setItem("arbiter-universe-v5", JSON.stringify(universe)); }, [universe, hydrated]);
   useEffect(() => { if (hydrated) localStorage.setItem("arbiter-session-v1", JSON.stringify(session)); }, [session, hydrated]);
@@ -187,10 +193,13 @@ export default function Home() {
       if (!response.ok) throw new Error(`Market request failed (${response.status})`);
       const data = (await response.json()) as Snapshot;
       if (generation !== generationRef.current) return;
+      // Polled quotes carry the server's clock; shift them onto this device's clock so
+      // age checks and comparisons with streamed quotes hold when the two clocks differ.
+      const clockOffset = Number.isFinite(data.generatedAt) ? Date.now() - data.generatedAt : 0;
       const merged = { ...(restRef.current?.markets || emptyMarkets()) };
       for (const asset of universe.assets) for (const venue of universe.venues) {
         const quote = data.markets[asset]?.[venue];
-        if (quote) merged[asset] = { ...merged[asset], [venue]: quote };
+        if (quote) merged[asset] = { ...merged[asset], [venue]: { ...quote, receivedAt: quote.receivedAt + clockOffset } };
       }
       restRef.current = { ...data, markets: merged };
       for (const key of data.failedPairs || []) unavailableRef.current.set(key, Date.now() + 30000);
@@ -263,13 +272,21 @@ export default function Home() {
     return next.length >= 2 ? { ...previous, venues: next } : previous;
   });
   const updateSetting = (key: keyof Settings, raw: string) => {
-    const value = Number(raw);
-    const max = key === "budget" ? 100000 : key === "minNet" ? 10000 : 10;
-    if (raw === "" || !Number.isFinite(value) || value < 0 || value > max) return;
+    // Keep the typed text so a field can be cleared or pass through an out-of-range value mid-edit.
+    setDrafts((prev) => ({ ...prev, [key]: raw }));
+    const value = parseSetting(key, raw);
+    if (value === null) return;
     setSettings((prev) => ({ ...prev, [key]: value }));
     const venue = venues.find((item) => feeKey[item] === key);
     if (venue) setManualFees((prev) => prev.includes(venue) ? prev : [...prev, venue]);
   };
+  const endEdit = (key: keyof Settings) => setDrafts((prev) => { const next = { ...prev }; delete next[key]; return next; });
+  const fieldProps = (key: keyof Settings, value: number) => ({
+    value: drafts[key] ?? value,
+    onChange: (e: ChangeEvent<HTMLInputElement>) => updateSetting(key, e.target.value),
+    onBlur: () => endEdit(key),
+    "aria-invalid": drafts[key] !== undefined && parseSetting(key, drafts[key]) === null ? true : undefined,
+  });
 
   useEffect(() => {
     if (!hydrated) return;
@@ -364,8 +381,8 @@ export default function Home() {
           {!available && <p className="inline-note">Waiting for live quotes before starting.</p>}
           <div className="control-rule" />
           <div className="setting-head"><span>TRADE RULES</span><span>LOCAL SETTINGS</span></div>
-          <label className="field"><span>Budget per trade <small>USD</small></span><div className="input-wrap"><span>$</span><Input type="number" min="5" max="100000" step="1" value={settings.budget} onChange={(e) => updateSetting("budget", e.target.value)} aria-label="Budget per trade in dollars" /></div></label>
-          <label className="field"><span>Minimum estimated profit <small>USD</small></span><div className="input-wrap"><span>$</span><Input type="number" min="0" max="10000" step="0.01" value={settings.minNet} onChange={(e) => updateSetting("minNet", e.target.value)} aria-label="Minimum estimated profit in dollars" /></div></label>
+          <label className="field"><span>Budget per trade <small>USD</small></span><div className="input-wrap"><span>$</span><Input type="number" min="5" max="100000" step="1" {...fieldProps("budget", settings.budget)} aria-label="Budget per trade in dollars" /></div></label>
+          <label className="field"><span>Minimum estimated profit <small>USD</small></span><div className="input-wrap"><span>$</span><Input type="number" min="0" max="10000" step="0.01" {...fieldProps("minNet", settings.minNet)} aria-label="Minimum estimated profit in dollars" /></div></label>
           <div className="control-rule" />
           <div className="setting-head"><span>COST ASSUMPTIONS</span><span>PER LEG</span></div>
           <div className="fee-sync"><span>{feeSnapshot ? `${Object.keys(feeSnapshot.rates).length}/${Object.keys(publicFeeSources).length} public base tiers · checked ${new Date(feeSnapshot.checkedAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}` : feeLoading ? "Checking public fee schedules…" : "Using editable fee estimates"}</span><button type="button" onClick={() => void refreshFees(true)} disabled={feeLoading}>{feeLoading ? "Checking…" : "Refresh fees"}</button></div>
@@ -376,9 +393,9 @@ export default function Home() {
             const key = feeKey[venue];
             const published = feeSnapshot?.rates[venue];
             const manual = manualFees.includes(venue);
-            return <div className="fee-field" key={venue}><label className="field"><span>{venue} fee</span><div className="input-wrap percent-wrap"><Input type="number" min="0" max="10" step="0.01" value={appliedSettings[key]} onChange={(e) => updateSetting(key, e.target.value)} aria-label={`${venue} fee percent`} /><span>%</span></div></label><div className="fee-source">{manual ? "Manual rate" : published ? <a href={published.url} target="_blank" rel="noopener noreferrer">Public base tier ↗</a> : publicFeeSources[venue] ? <><span>Estimate · </span><a href={publicFeeSources[venue]} target="_blank" rel="noopener noreferrer">Schedule ↗</a></> : "Editable estimate"}{manual && published && <button type="button" onClick={() => setManualFees((previous) => previous.filter((item) => item !== venue))}>Use public</button>}</div></div>;
+            return <div className="fee-field" key={venue}><label className="field"><span>{venue} fee</span><div className="input-wrap percent-wrap"><Input type="number" min="0" max="10" step="0.01" {...fieldProps(key, appliedSettings[key])} aria-label={`${venue} fee percent`} /><span>%</span></div></label><div className="fee-source">{manual ? "Manual rate" : published ? <a href={published.url} target="_blank" rel="noopener noreferrer">Public base tier ↗</a> : feeScheduleLinks[venue] ? <><span>Estimate · </span><a href={feeScheduleLinks[venue]} target="_blank" rel="noopener noreferrer">Schedule ↗</a></> : "Editable estimate"}{manual && published && <button type="button" onClick={() => setManualFees((previous) => previous.filter((item) => item !== venue))}>Use public</button>}</div></div>;
           })}</div>
-          <label className="field"><span>Price movement buffer <small>each side</small></span><div className="input-wrap percent-wrap"><Input type="number" min="0" max="10" step="0.01" value={settings.buffer} onChange={(e) => updateSetting("buffer", e.target.value)} aria-label="Price movement buffer percent for each side" /><span>%</span></div></label>
+          <label className="field"><span>Price movement buffer <small>each side</small></span><div className="input-wrap percent-wrap"><Input type="number" min="0" max="10" step="0.01" {...fieldProps("buffer", settings.buffer)} aria-label="Price movement buffer percent for each side" /><span>%</span></div></label>
           <div className="control-rule" />
           <div className="bot-footer"><div><span className="bot-footer-label">AUTO SCAN</span><span className="bot-footer-sub">Only while this page is open</span></div><Switch checked={running} onCheckedChange={(value) => setRunning(!!value)} disabled={!available && !running} aria-label="Auto scan and paper trade" /></div>
         </aside>

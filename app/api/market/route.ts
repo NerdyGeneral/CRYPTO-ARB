@@ -28,7 +28,8 @@ async function fetchBook(symbol: SymbolName, venue: Venue): Promise<{ symbol: Sy
                 : `https://api.crypto.com/exchange/v1/public/get-book?instrument_name=${pair}&depth=1`;
     const response = await fetch(url, {
       method: venue === "CEX.IO" ? "POST" : "GET",
-      headers: { Accept: "application/json", ...(venue === "CEX.IO" ? { "Content-Type": "application/json" } : {}) },
+      // Coinbase intermittently rejects requests without a User-Agent (HTTP 400).
+      headers: { Accept: "application/json", "User-Agent": "arbiter-live/0.1", ...(venue === "CEX.IO" ? { "Content-Type": "application/json" } : {}) },
       ...(venue === "CEX.IO" ? { body: JSON.stringify({ pair: `${symbol}-USD` }) } : {}),
       cache: "no-store", signal: AbortSignal.timeout(3500),
     });
