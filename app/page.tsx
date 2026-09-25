@@ -144,7 +144,7 @@ export default function Home() {
     setSession((previous) => {
       const now = Date.now();
       const candidates = routesFor(snapshotRef.current, settingsRef.current, previous.balance, universeRef.current, now);
-      const chosen = candidates.find((candidate) => !candidate.indicative && candidate.net > 0 && candidate.net >= settingsRef.current.minNet &&
+      const chosen = candidates.find((candidate) => !candidate.indicative && !candidate.suspect && candidate.net > 0 && candidate.net >= settingsRef.current.minNet &&
         !previous.trades.some((trade) => trade.key === candidate.key && now - trade.time < 60000));
       return { balance: previous.balance + (chosen?.net || 0), scans: previous.scans + 1,
         tradeCount: previous.tradeCount + (chosen ? 1 : 0),
@@ -253,7 +253,7 @@ export default function Home() {
   const visibleRoutes = showAllRoutes ? routes : universe.venues.includes("Crypto.com")
     ? [...routes.filter((route) => !route.indicative).slice(0, 12), ...routes.filter((route) => route.indicative).slice(0, 4)]
     : routes.slice(0, 16);
-  const best = routes.find((route) => !route.indicative);
+  const best = routes.find((route) => !route.indicative && !route.suspect);
   const pnl = session.balance - 500;
   const available = !!best;
   useEffect(() => { availableRef.current = available; }, [available]);
@@ -367,7 +367,7 @@ export default function Home() {
                 <TableCell><div className="pair-cell"><span className={`coin-icon coin-${route.symbol.toLowerCase()}`}>{({ BTC: "₿", ETH: "Ξ", SOL: "◎", XRP: "✕", DOGE: "Ð", LTC: "Ł", ADA: "₳", AVAX: "A", LINK: "⬡", XLM: "✦", BCH: "₿", UNI: "◈" } as Partial<Record<SymbolName, string>>)[route.symbol] || route.symbol[0]}</span><span><strong>{route.symbol}<small> / {route.indicative ? "USD bundle" : "USD"}</small></strong><span className="venue-route">{route.buy} <ArrowRight size={12} aria-hidden="true" /> {route.sell}</span><span className="quote-detail">{route.streamLegs ? `${route.streamLegs}/2 streamed` : "REST quotes"} · {(route.ageMs / 1000).toFixed(1)}s old</span></span></div></TableCell>
                 <TableCell className="mono">{price(route.ask)}</TableCell><TableCell className="mono">{price(route.bid)}</TableCell>
                 <TableCell className={`mono ${route.grossPct > 0 ? "positive" : "muted-number"}`}>{pct(route.grossPct)}</TableCell>
-                <TableCell className="align-right"><strong className={`net-number ${route.indicative ? "indicative-number" : route.net > 0 ? "positive" : route.net < 0 ? "negative" : ""}`}>{signedMoney(route.net)}</strong><span className="net-percent">{route.indicative ? "INDICATIVE · NO CONVERSION" : pct(route.netPct)}</span><span className="fee-breakdown">Buy fee {money(route.buyFee)} · sell fee {money(route.sellFee)}<br />Buffer {money(route.movementCost)}</span></TableCell>
+                <TableCell className="align-right"><strong className={`net-number ${route.indicative || route.suspect ? "indicative-number" : route.net > 0 ? "positive" : route.net < 0 ? "negative" : ""}`}>{signedMoney(route.net)}</strong><span className="net-percent">{route.indicative ? "INDICATIVE · NO CONVERSION" : route.suspect ? "SUSPECT GAP · NOT TRADED" : pct(route.netPct)}</span><span className="fee-breakdown">Buy fee {money(route.buyFee)} · sell fee {money(route.sellFee)}<br />Buffer {money(route.movementCost)}</span></TableCell>
               </TableRow>)}
               {!routes.length && <TableRow><TableCell colSpan={5}><div className="table-empty">{loading ? "Connecting to live order books…" : "No fresh, comparable quotes right now. The monitor will retry automatically."}</div></TableCell></TableRow>}
             </TableBody>
@@ -396,6 +396,7 @@ export default function Home() {
             return <div className="fee-field" key={venue}><label className="field"><span>{venue} fee</span><div className="input-wrap percent-wrap"><Input type="number" min="0" max="10" step="0.01" {...fieldProps(key, appliedSettings[key])} aria-label={`${venue} fee percent`} /><span>%</span></div></label><div className="fee-source">{manual ? "Manual rate" : published ? <a href={published.url} target="_blank" rel="noopener noreferrer">Public base tier ↗</a> : feeScheduleLinks[venue] ? <><span>Estimate · </span><a href={feeScheduleLinks[venue]} target="_blank" rel="noopener noreferrer">Schedule ↗</a></> : "Editable estimate"}{manual && published && <button type="button" onClick={() => setManualFees((previous) => previous.filter((item) => item !== venue))}>Use public</button>}</div></div>;
           })}</div>
           <label className="field"><span>Price movement buffer <small>each side</small></span><div className="input-wrap percent-wrap"><Input type="number" min="0" max="10" step="0.01" {...fieldProps("buffer", settings.buffer)} aria-label="Price movement buffer percent for each side" /><span>%</span></div></label>
+          <label className="field"><span>Max believable gap <small>raw, before fees</small></span><div className="input-wrap percent-wrap"><Input type="number" min="0.1" max="50" step="0.1" {...fieldProps("maxGap", settings.maxGap)} aria-label="Maximum believable raw gap percent" /><span>%</span></div></label>
           <div className="control-rule" />
           <div className="bot-footer"><div><span className="bot-footer-label">AUTO SCAN</span><span className="bot-footer-sub">Only while this page is open</span></div><Switch checked={running} onCheckedChange={(value) => setRunning(!!value)} disabled={!available && !running} aria-label="Auto scan and paper trade" /></div>
         </aside>
