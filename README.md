@@ -31,22 +31,46 @@ The web page only scans while it is open and visible. `ArbiterPaper.exe` runs th
 - *Cross-exchange*: buy a coin on one exchange and sell it on another. Either side can be priced in USD, USDT or USDC. Stablecoin legs are valued at that exchange's live stablecoin/USD price, including the cost of converting back to USD (`conversionFee`, default 0.2%, Kraken's entry rate; cheaper where the exchange's own fee is lower).
 - *Triangle*: three trades on one exchange that start and end in USD, for example USD → BTC → ETH → USD or USD → USDT → SOL → USD. No money needs to move between exchanges, but it pays three taker fees.
 
-Every estimate includes each exchange's entry-tier taker fee, conversion costs and the price-movement buffer on every leg, sized to the top of each order book. A paper trade never fills twice against the same unchanged quote, because a real fill would have used that liquidity up.
+Every estimate includes each exchange's entry-tier taker fee, conversion costs and the price-movement buffer on every leg, sized to the top of each order book. A paper trade never fills twice against the same unchanged quote, because a real fill would have used that liquidity up. The *Status* column under **Current best routes** says why each route was or wasn't traded: below your minimum profit, loses money after costs, quote already used, traded in the last minute, or next in line (one trade per scan).
+
+**Dashboard tabs:**
+
+- *Overview* — balances, current routes with their status, suspect gaps with their verdicts, and each exchange's feed and measured latency.
+- *Paper trades* — the reality check for every trade, the trade log and the hourly summary.
+- *Accuracy* — how far the paper numbers are from reality (below), with charts by hour.
+- *Settings* — every option in a form. Budget, minimum profit, fees, buffer and max gap apply on the next scan; coin and exchange changes reload the markets; port, browser and keep-awake apply on the next start; starting balance applies from the next session reset. *Load defaults* fills in the defaults for you to review before saving.
+
+**Realistic results (shadow mode).** Paper trades assume every quote is still there when the order arrives. Shadow mode replays each paper trade as real immediate-or-cancel orders would have landed: each exchange's round trip is measured continuously from your PC, and each leg is checked against that exchange's order book one round trip after the decision. A leg fills only if its price (or better) is still on the book, up to the size shown. The trade is marked *filled*, *one side only* (the other side is sold or bought back at the next prices, fees included) or *missed*. Realistic P&L is what those replays would have made.
+
+**Accuracy tab:**
+
+- *Wouldn't have worked* — share of paper trades that filled on one side only or not at all.
+- *Avg estimate error* — average of realistic minus paper profit per trade, with the typical size of the miss.
+- *Profit turned loss* — share of trades predicted to make money that would have lost money.
+- *Paper profit kept* — realistic profit as a share of paper profit.
+- *Suspects that look real* — of the suspect gaps that could be checked, the share where no barrier was found: how often the max-gap rule may be too cautious.
+- *Traded routes with a barrier* — every cross-exchange route that gets paper-traded goes through the same check. This is the share where one was found anyway: how often the rule isn't cautious enough. With money already on both exchanges one trade still goes through, but closed transfers or a different token stop you rebalancing, so the gap can't be repeated.
+
+**Suspect gaps.** Routes whose raw gap is above `maxGap` (default 2%) are never traded. Each one is checked automatically, one at a time:
+
+- *Different tokens* — CoinGecko's mapping of each exchange's ticker (or, where CoinGecko doesn't track it, the name the exchange publishes) shows two different coins sharing a symbol, for example Litentry and Lighter, both "LIT".
+- *Transfers closed* — the buy exchange has withdrawals off or the sell exchange has deposits off (Kraken, Coinbase, Bitstamp and CEX.IO publish this; Gemini, Binance.US, bitFlyer and OKX need an account to tell).
+- *Price outlier* — CoinGecko flags one exchange's price as an outlier against the rest of the market.
+- *No barrier found* — none of the above. It could be genuine, but check withdrawal fees and times before trusting it.
+
+Click a suspect for the individual checks, or *Check now* to re-run them. CoinGecko's free API allows only a few requests a minute, so the first checks take a few minutes after start.
 
 **Results** are saved in an `arbiter-data` folder next to the exe:
 
 - `trades.csv` — every paper trade, with its route, size, costs and legs
-- `hourly.csv` — one summary row per hour: trades, P&L, best cross-exchange and triangle net, suspect gaps
-- `session.json` — balance and counters
+- `shadow.csv` — every replay: paper and realistic profit, outcome, how much filled, latency and anything unwound
+- `verdicts.csv` — every suspect and traded-route check
+- `hourly.csv` — one summary row per hour: trades, paper and realistic P&L, estimate error, replay outcomes, best cross-exchange and triangle net, suspect gaps
+- `session.json` — balances and counters
 - `listings.json` — the last exchange listings
-- `config.json` — settings. Restart after editing:
-  - `topCoins`, `extraCoins`, `excludeCoins` — which coins to scan
-  - `venues` — which exchanges to use
-  - `triangular` — turn triangle routes on or off
-  - `conversionFee` — stablecoin conversion cost
-  - `settings` — budget, minimum profit, per-exchange fees, buffer and `maxGap`
+- `config.json` — the settings from the Settings tab. It can also be edited by hand while the engine is stopped.
 
-Routes whose raw gap is above `maxGap` (default 2%) are shown as suspect and never traded. Gaps that large almost always mean the two listings cannot be arbitraged, for example because transfers are paused or they are different tokens.
+*Reset session* on the dashboard archives these logs (they are renamed, not deleted) and starts the balances and accuracy figures over.
 
 Scanning uses roughly half of one CPU core and 250 MB of memory.
 

@@ -1,9 +1,12 @@
 import fs from "node:fs";
 import path from "node:path";
 import { isSea } from "node:sea";
+import { emptyTally, type ShadowTally, type VerdictGroup } from "../lib/accuracy";
 import type { Listing } from "../lib/discovery";
 import { defaults, settingRange, venues, type Settings, type Venue } from "../lib/market";
 import type { Opportunity } from "../lib/opportunities";
+import type { ShadowResult } from "../lib/shadow";
+import type { VerdictKind } from "../lib/verify";
 
 const CONFIG_VERSION = 2;
 
@@ -24,14 +27,23 @@ export type EngineConfig = {
   settings: Settings;
 };
 
-export type SessionFile = { startedAt: number; balance: number; scans: number; tradeCount: number };
+export type SessionFile = {
+  // The balance this session started from; a new starting balance applies from the next reset.
+  startedAt: number; startingBalance: number; balance: number; scans: number; tradeCount: number;
+  // Shadow mode: the same trades replayed against the books one round trip later.
+  shadowSince: number; shadow: ShadowTally;
+};
+
+export type ShadowRecord = ShadowResult & { time: number; path: string; kind: string; latencyMs: number };
 
 export type TradeRecord = Opportunity & { time: number };
 
 export type HourlyRow = {
   hour: string; scans: number; trades: number; pnl: number; bestNetPct: number | null; bestTriangleNetPct: number | null;
-  bestGrossPct: number | null; suspectRoutes: number; quotes: number; avgScanMs: number;
+  bestGrossPct: number | null; suspectRoutes: number; quotes: number; avgScanMs: number; shadow: ShadowTally;
 };
+
+export type VerdictRecord = { time: number; group: VerdictGroup; key: string; path: string; kind: VerdictKind; grossPct: number };
 
 // Crypto.com routes are USD-bundle estimates, so the engine leaves them out by default.
 export const defaultConfig: EngineConfig = {
@@ -50,7 +62,41 @@ export const defaultConfig: EngineConfig = {
 };
 
 const TRADES_HEADER = "time,kind,path,notional_usd,gross_pct,net_usd,net_pct,fees_usd,conversion_usd,buffer_usd,quote_age_ms,legs";
-const HOURLY_HEADER = "hour,scans,trades,pnl_usd,best_net_pct,best_triangle_net_pct,best_gross_pct,suspect_routes,quotes,avg_scan_ms";
+const HOURLY_HEADER = "hour,scans,trades,pnl_usd,best_net_pct,best_triangle_net_pct,best_gross_pct,suspect_routes,quotes,avg_scan_ms," +
+  "shadow_expected_usd,shadow_pnl_usd,shadow_abs_error_usd,shadow_filled,shadow_partial,shadow_missed,shadow_losses";
+const SHADOW_HEADER = "time,kind,path,expected_net_usd,realized_net_usd,outcome,filled_fraction,latency_ms,unwound";
+const VERDICT_HEADER = "time,group,route_key,path,kind,gross_pct";
+
+// Validates a config from disk or the dashboard; anything missing or out of range takes its default.
+export function normalizeConfig(raw: unknown): EngineConfig {
+  const saved = (raw || {}) as Partial<Record<keyof EngineConfig, unknown>> & { settings?: Partial<Record<keyof Settings, unknown>> };
+  const number = (value: unknown, fallback: number, min: number, max: number) =>
+    typeof value === "number" && Number.isFinite(value) && value >= min && value <= max ? value : fallback;
+  const bool = (value: unknown, fallback: boolean) => typeof value === "boolean" ? value : fallback;
+  const coins = (value: unknown) => Array.isArray(value) ? [...new Set(value.filter((c): c is string => typeof c === "string").map((c) => c.trim().toUpperCase()).filter(Boolean))] : [];
+  const settings = Object.fromEntries(Object.entries(defaults).map(([key, value]) => {
+    const [min, max] = settingRange(key as keyof Settings);
+    return [key, number(saved.settings?.[key as keyof Settings], value, min, max)];
+  })) as Settings;
+  // Configs from before version 2 predate Binance.US, so their exchange list is replaced by the default.
+  const current = saved.version === CONFIG_VERSION;
+  const chosenVenues = current && Array.isArray(saved.venues) ? venues.filter((venue) => (saved.venues as unknown[]).includes(venue)) : defaultConfig.venues;
+  const config: EngineConfig = {
+    version: CONFIG_VERSION,
+    port: number(saved.port, defaultConfig.port, 1024, 65535),
+    openBrowser: bool(saved.openBrowser, defaultConfig.openBrowser),
+    keepAwake: bool(saved.keepAwake, defaultConfig.keepAwake),
+    startingBalance: number(saved.startingBalance, defaultConfig.startingBalance, 10, 10_000_000),
+    venues: chosenVenues.length >= 2 ? chosenVenues : defaultConfig.venues,
+    topCoins: Math.round(number(saved.topCoins, defaultConfig.topCoins, 1, 500)),
+    extraCoins: coins(saved.extraCoins),
+    excludeCoins: coins(saved.excludeCoins),
+    triangular: bool(saved.triangular, defaultConfig.triangular),
+    conversionFee: number(saved.conversionFee, defaultConfig.conversionFee, 0, 5),
+    settings,
+  };
+  return config;
+}
 
 export function resolveDataDir(): string {
   if (process.env.ARBITER_DATA_DIR) return path.resolve(process.env.ARBITER_DATA_DIR);
@@ -82,6 +128,8 @@ export class Store {
   private readonly tradesFile: string;
   private readonly hourlyFile: string;
   private readonly listingFile: string;
+  private readonly shadowFile: string;
+  private readonly verdictFile: string;
 
   constructor(dir: string) {
     this.dir = dir;
@@ -91,8 +139,10 @@ export class Store {
     this.tradesFile = path.join(dir, "trades.csv");
     this.hourlyFile = path.join(dir, "hourly.csv");
     this.listingFile = path.join(dir, "listings.json");
+    this.shadowFile = path.join(dir, "shadow.csv");
+    this.verdictFile = path.join(dir, "verdicts.csv");
     // Logs written by an older version have different columns; set them aside rather than mix formats.
-    for (const [file, header] of [[this.tradesFile, TRADES_HEADER], [this.hourlyFile, HOURLY_HEADER]]) {
+    for (const [file, header] of [[this.tradesFile, TRADES_HEADER], [this.hourlyFile, HOURLY_HEADER], [this.shadowFile, SHADOW_HEADER], [this.verdictFile, VERDICT_HEADER]]) {
       const first = fs.existsSync(file) ? fs.readFileSync(file, "utf8").split("\n", 1)[0] : header;
       if (first !== header) fs.renameSync(file, file.replace(/\.csv$/, `-old-format-${stamp()}.csv`));
     }
@@ -100,41 +150,31 @@ export class Store {
 
   // Missing or invalid values fall back to defaults; the file is rewritten so every option is visible.
   loadConfig(): EngineConfig {
-    const saved = (readJson(this.configFile) || {}) as Partial<Record<keyof EngineConfig, unknown>> & { settings?: Partial<Record<keyof Settings, unknown>> };
-    const number = (value: unknown, fallback: number, min: number, max: number) =>
-      typeof value === "number" && Number.isFinite(value) && value >= min && value <= max ? value : fallback;
-    const bool = (value: unknown, fallback: boolean) => typeof value === "boolean" ? value : fallback;
-    const coins = (value: unknown) => Array.isArray(value) ? [...new Set(value.filter((c): c is string => typeof c === "string").map((c) => c.trim().toUpperCase()).filter(Boolean))] : [];
-    const settings = Object.fromEntries(Object.entries(defaults).map(([key, value]) => {
-      const [min, max] = settingRange(key as keyof Settings);
-      return [key, number(saved.settings?.[key as keyof Settings], value, min, max)];
-    })) as Settings;
-    // Configs from before version 2 predate Binance.US, so their exchange list is replaced by the default.
-    const current = saved.version === CONFIG_VERSION;
-    const chosenVenues = current && Array.isArray(saved.venues) ? venues.filter((venue) => (saved.venues as unknown[]).includes(venue)) : defaultConfig.venues;
-    const config: EngineConfig = {
-      version: CONFIG_VERSION,
-      port: number(saved.port, defaultConfig.port, 1024, 65535),
-      openBrowser: bool(saved.openBrowser, defaultConfig.openBrowser),
-      keepAwake: bool(saved.keepAwake, defaultConfig.keepAwake),
-      startingBalance: number(saved.startingBalance, defaultConfig.startingBalance, 10, 10_000_000),
-      venues: chosenVenues.length >= 2 ? chosenVenues : defaultConfig.venues,
-      topCoins: Math.round(number(saved.topCoins, defaultConfig.topCoins, 1, 500)),
-      extraCoins: coins(saved.extraCoins),
-      excludeCoins: coins(saved.excludeCoins),
-      triangular: bool(saved.triangular, defaultConfig.triangular),
-      conversionFee: number(saved.conversionFee, defaultConfig.conversionFee, 0, 5),
-      settings,
-    };
-    writeJson(this.configFile, config);
+    const config = normalizeConfig(readJson(this.configFile));
+    this.saveConfig(config);
     return config;
   }
 
+  saveConfig(config: EngineConfig) { writeJson(this.configFile, config); }
+
   loadSession(startingBalance: number): SessionFile {
     const saved = readJson(this.sessionFile) as Partial<SessionFile> | null;
-    if (saved && [saved.startedAt, saved.balance, saved.scans, saved.tradeCount].every((n) => typeof n === "number" && Number.isFinite(n)))
-      return saved as SessionFile;
-    return { startedAt: Date.now(), balance: startingBalance, scans: 0, tradeCount: 0 };
+    const valid = (n: unknown): n is number => typeof n === "number" && Number.isFinite(n);
+    const fresh = Store.freshSession(startingBalance);
+    if (!saved || ![saved.startedAt, saved.balance, saved.scans, saved.tradeCount].every(valid)) return fresh;
+    // Sessions from before shadow mode start their shadow tally now; ones from before a stored starting
+    // balance keep measuring from the configured one.
+    const tally = saved.shadow && Object.keys(emptyTally()).every((key) => valid(saved.shadow![key as keyof ShadowTally])) ? saved.shadow : null;
+    return {
+      startedAt: saved.startedAt!, startingBalance: valid(saved.startingBalance) ? saved.startingBalance : startingBalance,
+      balance: saved.balance!, scans: saved.scans!, tradeCount: saved.tradeCount!,
+      shadowSince: tally && valid(saved.shadowSince) ? saved.shadowSince : fresh.shadowSince, shadow: tally || emptyTally(),
+    };
+  }
+
+  static freshSession(startingBalance: number): SessionFile {
+    const now = Date.now();
+    return { startedAt: now, startingBalance, balance: startingBalance, scans: 0, tradeCount: 0, shadowSince: now, shadow: emptyTally() };
   }
 
   saveSession(session: SessionFile) { writeJson(this.sessionFile, session); }
@@ -155,10 +195,27 @@ export class Store {
   }
 
   appendHourly(row: HourlyRow) {
+    const t = row.shadow;
     const line = [row.hour, row.scans, row.trades, row.pnl.toFixed(4), row.bestNetPct?.toFixed(4), row.bestTriangleNetPct?.toFixed(4),
-      row.bestGrossPct?.toFixed(4), row.suspectRoutes, row.quotes, row.avgScanMs.toFixed(1)].map(csvCell).join(",");
+      row.bestGrossPct?.toFixed(4), row.suspectRoutes, row.quotes, row.avgScanMs.toFixed(1), t.expected.toFixed(4), t.realized.toFixed(4),
+      t.absError.toFixed(4), t.filled, t.partial, t.missed, t.losses].map(csvCell).join(",");
     this.append(this.hourlyFile, HOURLY_HEADER, line);
   }
+
+  appendShadow(record: ShadowRecord) {
+    const line = [new Date(record.time).toISOString(), record.kind, record.path, record.expectedNet.toFixed(4), record.realizedNet.toFixed(4),
+      record.outcome, record.filledFraction.toFixed(3), Math.round(record.latencyMs), record.unwound.join("; ")].map(csvCell).join(",");
+    this.append(this.shadowFile, SHADOW_HEADER, line);
+  }
+
+  readRecentShadow(limit: number): Record<string, string>[] { return this.readCsvTail(this.shadowFile, limit); }
+
+  appendVerdict(record: VerdictRecord) {
+    const line = [new Date(record.time).toISOString(), record.group, record.key, record.path, record.kind, record.grossPct.toFixed(4)].map(csvCell).join(",");
+    this.append(this.verdictFile, VERDICT_HEADER, line);
+  }
+
+  readRecentVerdicts(limit: number): Record<string, string>[] { return this.readCsvTail(this.verdictFile, limit); }
 
   readRecentTrades(limit: number): Record<string, string>[] { return this.readCsvTail(this.tradesFile, limit); }
   readRecentHours(limit: number): Record<string, string>[] { return this.readCsvTail(this.hourlyFile, limit); }
@@ -166,7 +223,7 @@ export class Store {
   // Keep the CSV files but archive them so a reset starts a clean log.
   archiveLogs() {
     const suffix = stamp();
-    for (const file of [this.tradesFile, this.hourlyFile]) if (fs.existsSync(file)) fs.renameSync(file, file.replace(/\.csv$/, `-${suffix}.csv`));
+    for (const file of [this.tradesFile, this.hourlyFile, this.shadowFile, this.verdictFile]) if (fs.existsSync(file)) fs.renameSync(file, file.replace(/\.csv$/, `-${suffix}.csv`));
   }
 
   private append(file: string, header: string, line: string) {

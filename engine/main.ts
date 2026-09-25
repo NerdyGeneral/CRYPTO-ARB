@@ -2,7 +2,8 @@ import { spawn } from "node:child_process";
 import http from "node:http";
 import statusPage from "./status.html";
 import { Engine } from "./engine";
-import { Store, resolveDataDir } from "./store";
+import { Store, defaultConfig, resolveDataDir } from "./store";
+import { settingRange, type Settings } from "../lib/market";
 
 // An unattended run should log a stray error and keep scanning rather than exit.
 for (const event of ["uncaughtException", "unhandledRejection"] as const)
@@ -52,9 +53,16 @@ const server = http.createServer(async (request, response) => {
     response.writeHead(status, { "Content-Type": type, "Cache-Control": "no-store" });
     response.end(body);
   };
+  // Only answer requests addressed to this machine by name, which defeats DNS-rebinding pages.
+  const host = String(request.headers.host || "");
+  if (host !== `127.0.0.1:${config.port}` && host !== `localhost:${config.port}`) return send(403, "application/json", '{"error":"forbidden host"}');
   const path = (request.url || "/").split("?")[0];
   if (request.method === "GET" && path === "/") return send(200, "text/html; charset=utf-8", statusPage);
   if (request.method === "GET" && path === "/api/state") return send(200, "application/json", JSON.stringify(engine.state()));
+  if (request.method === "GET" && path === "/api/config") {
+    const ranges = Object.fromEntries(Object.keys(defaultConfig.settings).map((key) => [key, settingRange(key as keyof Settings)]));
+    return send(200, "application/json", JSON.stringify({ config: engine.currentConfig, defaults: defaultConfig, ranges }));
+  }
   // Controls need a custom header, which a page on another site cannot send without a preflight this server never approves.
   if (request.method === "POST" && request.headers["x-arbiter"] === "1") {
     if (path === "/api/running") {
@@ -63,6 +71,19 @@ const server = http.createServer(async (request, response) => {
       engine.setRunning(body.running);
       console.log(`${new Date().toLocaleTimeString()}  Paper bot ${body.running ? "resumed" : "paused"}`);
       return send(200, "application/json", JSON.stringify({ running: engine.running }));
+    }
+    if (path === "/api/config") {
+      const body = await readBody(request);
+      if (!body || typeof body !== "object" || Array.isArray(body)) return send(400, "application/json", '{"error":"expected an object"}');
+      const result = engine.updateConfig(body as Record<string, unknown>);
+      console.log(`${new Date().toLocaleTimeString()}  Settings saved from the dashboard${result.reloadingMarkets ? "; reloading markets" : ""}`);
+      return send(200, "application/json", JSON.stringify(result));
+    }
+    if (path === "/api/verify") {
+      const body = await readBody(request) as { key?: unknown };
+      if (typeof body.key !== "string") return send(400, "application/json", '{"error":"key must be a string"}');
+      const verdict = await engine.verifyRoute(body.key);
+      return send(verdict ? 200 : 409, "application/json", JSON.stringify(verdict ? { verdict } : { error: "Route is no longer a suspect, or a check is already running" }));
     }
     if (path === "/api/reset") {
       engine.resetSession();
@@ -111,7 +132,7 @@ server.listen(config.port, "127.0.0.1", async () => {
     `  Balance:    $${engine.session.balance.toFixed(2)} paper · ${engine.session.tradeCount} trades so far`,
     "",
     "  Keep this window open. Close it (or press Ctrl+C) to stop; progress is saved.",
-    "  Settings live in config.json in the data folder; restart after editing it.",
+    "  Change settings on the dashboard's Settings tab.",
     "",
   ].join("\n"));
 });

@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { defaults, emptyMarkets, routesFor, type Quote, type Settings } from "../lib/market";
 import { keyOf, makeMarket, type Market } from "../lib/markets";
 import { selectMarkets } from "../lib/discovery";
-import { chooseTrade, scanOpportunities, type Opportunity } from "../lib/opportunities";
+import { blockReason, chooseTrade, scanOpportunities, type Opportunity } from "../lib/opportunities";
 
 const now = 1_000_000;
 const quote = (bid: number, ask: number, size = 1000, receivedAt = now - 100): Quote => ({ bid, bidSize: size, ask, askSize: size, receivedAt, source: "stream" });
@@ -88,8 +88,8 @@ test("a paper trade cannot fill twice against the same unchanged quote", () => {
     key, kind: "cross", coin: "GRT", venues: ["CEX.IO", "Binance.US"], path: key, notional: 50, grossPct: 1, net, netPct: 0.6,
     fees: 0.1, conversion: 0, buffer: 0.1, ageMs: 100, suspect: false,
     legs: [
-      { venue: "CEX.IO", pair: "GRT/USD", side: "buy", price: 0.0285, market: `CEX.IO|GRT/USD|${key}`, size: 5000 },
-      { venue: "Binance.US", pair: "GRT/USD", side: "sell", price: sellPrice, market: "Binance.US|GRT/USD", size: sellSize },
+      { venue: "CEX.IO", pair: "GRT/USD", base: "GRT", quote: "USD", side: "buy", price: 0.0285, market: `CEX.IO|GRT/USD|${key}`, size: 5000, qty: 1700, fee: 0.0025 },
+      { venue: "Binance.US", pair: "GRT/USD", base: "GRT", quote: "USD", side: "sell", price: sellPrice, market: "Binance.US|GRT/USD", size: sellSize, qty: 1700, fee: 0.0002 },
     ],
   });
   const memory = { recent: new Map<string, number>(), consumed: new Map<string, { price: number; size: number }>() };
@@ -100,8 +100,13 @@ test("a paper trade cannot fill twice against the same unchanged quote", () => {
   assert.equal(chooseTrade([route("a", 0.0288, 2600)], memory, { ...options, now: now + 61_000 }), null);
   // Once the book shows a new bid, it can trade again.
   assert.equal(chooseTrade([route("b", 0.02881, 900)], memory, { ...options, now: now + 2000 })?.key, "b");
-  // Routes below the minimum are skipped.
+  // Routes below the minimum are skipped, and every block has a reason the dashboard can show.
   assert.equal(chooseTrade([route("c", 0.03, 10, 0.1)], memory, options), null);
+  assert.equal(blockReason(route("c", 0.03, 10, 0.1), memory, options), "Below your $0.25 minimum");
+  assert.equal(blockReason(route("d", 0.03, 10, -0.2), memory, options), "Loses money after costs");
+  assert.equal(blockReason({ ...route("e", 0.03, 10), suspect: true }, memory, options), "Suspect gap");
+  assert.equal(blockReason(route("a", 0.0288, 2600), memory, { ...options, now: now + 1000 }), "Traded in the last minute");
+  assert.equal(blockReason(route("z", 0.02881, 900), memory, { ...options, now: now + 3000 }), "Quote already used by a paper trade");
 });
 
 test("market selection ranks coins by volume, needs two venues and caps books per venue", () => {
