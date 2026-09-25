@@ -104,6 +104,7 @@ export default function Home() {
     return next;
   }, [settings, feeSnapshot, manualFees]);
 
+  // eslint-disable-next-line react-hooks/set-state-in-effect -- localStorage is read after hydration so server and client markup match.
   useEffect(() => { setSettings(loadSettings()); setUniverse(loadUniverse()); setSession(loadSession()); setManualFees(loadFeeOverrides()); setHydrated(true); }, []);
   useEffect(() => { if (hydrated) localStorage.setItem("arbiter-settings-v2", JSON.stringify(settings)); }, [settings, hydrated]);
   useEffect(() => { if (hydrated) localStorage.setItem("arbiter-universe-v5", JSON.stringify(universe)); }, [universe, hydrated]);
@@ -125,6 +126,7 @@ export default function Home() {
   }, []);
   useEffect(() => {
     if (!hydrated) return;
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- initial fetch; refreshFees only flags loading before it awaits.
     void refreshFees();
     const timer = window.setInterval(() => { if (!document.hidden) void refreshFees(); }, 60 * 60 * 1000);
     return () => window.clearInterval(timer);
@@ -185,10 +187,10 @@ export default function Home() {
       if (!response.ok) throw new Error(`Market request failed (${response.status})`);
       const data = (await response.json()) as Snapshot;
       if (generation !== generationRef.current) return;
-      const merged = restRef.current?.markets || emptyMarkets();
+      const merged = { ...(restRef.current?.markets || emptyMarkets()) };
       for (const asset of universe.assets) for (const venue of universe.venues) {
         const quote = data.markets[asset]?.[venue];
-        if (quote) merged[asset][venue] = quote;
+        if (quote) merged[asset] = { ...merged[asset], [venue]: quote };
       }
       restRef.current = { ...data, markets: merged };
       for (const key of data.failedPairs || []) unavailableRef.current.set(key, Date.now() + 30000);
@@ -214,6 +216,7 @@ export default function Home() {
     if (scanTimerRef.current !== undefined) window.clearTimeout(scanTimerRef.current);
     scanTimerRef.current = undefined;
     snapshotRef.current = null;
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- clear stale quotes when the scanned universe changes.
     setSnapshot(null);
     setLoading(true);
     let updateTimer: number | undefined;
@@ -244,7 +247,7 @@ export default function Home() {
   const best = routes.find((route) => !route.indicative);
   const pnl = session.balance - 500;
   const available = !!best;
-  availableRef.current = available;
+  useEffect(() => { availableRef.current = available; }, [available]);
   const quoteCount = universe.assets.reduce((count, asset) => count + universe.venues.filter((venue) => !!snapshot?.markets[asset]?.[venue]).length, 0);
   const streamCount = universe.assets.reduce((count, asset) => count + universe.venues.filter((venue) => snapshot?.markets[asset]?.[venue]?.source === "stream").length, 0);
   const totalQuotes = universe.assets.reduce((count, asset) => count + universe.venues.filter((venue) => supportedPair(asset, venue)).length, 0);
