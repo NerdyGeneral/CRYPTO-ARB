@@ -357,7 +357,7 @@ export default function Home() {
       <div className="main-grid">
         <section className="panel opportunities" aria-labelledby="opportunity-title">
           <div className="panel-heading"><div><span className="section-index">01 / MARKET SCAN</span><h2 id="opportunity-title">Live opportunities</h2></div><span className="refresh-label">QUOTE DRIVEN · 4 SEC FALLBACK</span></div>
-          <div className="panel-subline">Compare fresh best-level prices and size from seven cash USD venues. Coinbase, Kraken, Gemini, Bitstamp, CEX.IO, and OKX US stream; bitFlyer and missing streams use rotating REST fallback. Paper scans run on new quotes, at most once every 250 ms.</div>
+          <div className="panel-subline">Compare fresh best-level prices and size from eight cash USD venues. Coinbase, Kraken, Gemini, Bitstamp, CEX.IO, Binance.US, and OKX US stream; bitFlyer and missing streams use rotating REST fallback. Paper scans run on new quotes, at most once every 250 ms.</div>
           {fetchError && <div className="feed-warning" role="status">Unable to reach market feeds. {fetchError} <button type="button" onClick={() => void refresh()}>Try again</button></div>}
           {!!snapshot?.errors.length && <div className="feed-warning" role="status"><details><summary>{snapshot.errors.length} selected REST pair feeds unavailable. Streaming quotes may still be available.</summary><div className="warning-details">{snapshot.errors.join(" · ")}</div></details></div>}
           <Table className="market-table">

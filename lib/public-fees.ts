@@ -18,6 +18,7 @@ export const feeScheduleLinks: Partial<Record<Venue, string>> = {
   Bitstamp: "https://www.bitstamp.net/fee-schedule/",
   "OKX US": "https://www.okx.com/en-us/fees",
   "Crypto.com": "https://crypto.com/exchange/document/fees-limits",
+  "Binance.US": "https://www.binance.us/fees",
 };
 
 export function parsePublishedTaker(venue: Venue, html: string): number | null {

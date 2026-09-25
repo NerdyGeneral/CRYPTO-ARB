@@ -1,4 +1,4 @@
-export type Venue = "Coinbase" | "Kraken" | "Gemini" | "Bitstamp" | "CEX.IO" | "Crypto.com" | "bitFlyer" | "OKX US";
+export type Venue = "Coinbase" | "Kraken" | "Gemini" | "Bitstamp" | "CEX.IO" | "Crypto.com" | "bitFlyer" | "OKX US" | "Binance.US";
 export type SymbolName = "BTC" | "ETH" | "SOL" | "XRP" | "DOGE" | "LTC" | "ADA" | "AVAX" | "LINK" | "XLM" | "BCH" | "UNI" | "AAVE" | "DOT" | "SHIB" | "SUI" | "HBAR" | "PEPE" | "NEAR" | "ETC" | "ATOM" | "TRX" | "OP" | "ARB" | "ALGO" | "APT" | "FIL" | "GRT" | "ICP" | "POL" | "ENS" | "BONK" | "BAT" | "CRV" | "FET" | "JUP" | "LDO" | "MANA" | "SEI" | "XTZ";
 export type Quote = { bid: number; bidSize: number; ask: number; askSize: number; receivedAt: number; source: "stream" | "poll" };
 export type Snapshot = {
@@ -12,7 +12,7 @@ export type PublicFee = { rate: number; checkedAt: number; url: string };
 export type PublicFeesResponse = { checkedAt: number; rates: Partial<Record<Venue, PublicFee>>; errors: string[] };
 export type Settings = {
   budget: number; minNet: number; coinbaseFee: number; krakenFee: number;
-  geminiFee: number; bitstampFee: number; cexFee: number; cryptoComFee: number; bitflyerFee: number; okxFee: number; buffer: number; maxGap: number;
+  geminiFee: number; bitstampFee: number; cexFee: number; cryptoComFee: number; bitflyerFee: number; okxFee: number; binanceUsFee: number; buffer: number; maxGap: number;
 };
 export type Route = {
   key: string; symbol: SymbolName; buy: Venue; sell: Venue; ask: number; bid: number;
@@ -24,7 +24,7 @@ export type Trade = Route & { id: string; time: number };
 export type Session = { balance: number; scans: number; tradeCount: number; trades: Trade[] };
 
 export const symbols: SymbolName[] = ["BTC", "ETH", "SOL", "XRP", "DOGE", "LTC", "ADA", "AVAX", "LINK", "XLM", "BCH", "UNI", "AAVE", "DOT", "SHIB", "SUI", "HBAR", "PEPE", "NEAR", "ETC", "ATOM", "TRX", "OP", "ARB", "ALGO", "APT", "FIL", "GRT", "ICP", "POL", "ENS", "BONK", "BAT", "CRV", "FET", "JUP", "LDO", "MANA", "SEI", "XTZ"];
-export const venues: Venue[] = ["Coinbase", "Kraken", "Gemini", "Bitstamp", "CEX.IO", "bitFlyer", "OKX US", "Crypto.com"];
+export const venues: Venue[] = ["Coinbase", "Kraken", "Gemini", "Bitstamp", "CEX.IO", "Binance.US", "bitFlyer", "OKX US", "Crypto.com"];
 export const defaultUniverse: Universe = { assets: symbols.slice(0, 16), venues: venues.filter((venue) => venue !== "Crypto.com") };
 // These US USD spot books are limited; don't request or count nonexistent pairs.
 const geminiUsd = new Set<SymbolName>(["BTC", "ETH", "SOL", "XRP", "DOGE", "LTC", "AVAX", "LINK", "BCH", "UNI", "AAVE", "DOT", "SHIB", "SUI", "PEPE", "ATOM", "TRX", "OP", "ARB", "FIL", "GRT", "POL", "ENS", "BONK", "BAT", "CRV", "FET", "JUP", "MANA", "XTZ"]);
@@ -32,6 +32,7 @@ const cexUsd = new Set<SymbolName>(symbols.filter((symbol) => symbol !== "HBAR" 
 const coinbaseUsd = new Set<SymbolName>(symbols.filter((symbol) => symbol !== "TRX" && symbol !== "JUP"));
 const bitstampUsd = new Set<SymbolName>(symbols.filter((symbol) => symbol !== "FIL" && symbol !== "ENS"));
 const cryptoComUsd = new Set<SymbolName>(symbols.filter((symbol) => symbol !== "TRX"));
+const binanceUsUsd = new Set<SymbolName>(symbols.filter((symbol) => !["ARB", "APT", "FIL", "BAT", "LDO", "MANA", "SEI", "XTZ"].includes(symbol)));
 export const supportedPair = (symbol: SymbolName, venue: Venue) =>
   venue === "bitFlyer" ? symbol === "BTC" || symbol === "ETH" :
   venue === "OKX US" ? symbol === "BTC" || symbol === "ETH" || symbol === "SOL" :
@@ -39,15 +40,16 @@ export const supportedPair = (symbol: SymbolName, venue: Venue) =>
   venue === "CEX.IO" ? cexUsd.has(symbol) :
   venue === "Coinbase" ? coinbaseUsd.has(symbol) :
   venue === "Bitstamp" ? bitstampUsd.has(symbol) :
-  venue === "Crypto.com" ? cryptoComUsd.has(symbol) : true;
+  venue === "Crypto.com" ? cryptoComUsd.has(symbol) :
+  venue === "Binance.US" ? binanceUsUsd.has(symbol) : true;
 export const feeKey: Record<Venue, keyof Settings> = {
-  Coinbase: "coinbaseFee", Kraken: "krakenFee", Gemini: "geminiFee", Bitstamp: "bitstampFee", "CEX.IO": "cexFee", "Crypto.com": "cryptoComFee", bitFlyer: "bitflyerFee", "OKX US": "okxFee",
+  Coinbase: "coinbaseFee", Kraken: "krakenFee", Gemini: "geminiFee", Bitstamp: "bitstampFee", "CEX.IO": "cexFee", "Crypto.com": "cryptoComFee", bitFlyer: "bitflyerFee", "OKX US": "okxFee", "Binance.US": "binanceUsFee",
 };
 // Editable assumptions, not promises of an account's actual fee tier. Entry-tier spot taker
-// rates as of September 2026: Coinbase Advanced (US) 0.90%, Gemini ActiveTrader 1.20%.
+// rates as of September 2026: Coinbase Advanced (US) 0.90%, Gemini ActiveTrader 1.20%, Binance.US 0.02%.
 export const defaults: Settings = {
   budget: 50, minNet: 0.25, coinbaseFee: 0.9, krakenFee: 0.8,
-  geminiFee: 1.2, bitstampFee: 0.5, cexFee: 0.25, cryptoComFee: 0.5, bitflyerFee: 0.1, okxFee: 0.5, buffer: 0.1,
+  geminiFee: 1.2, bitstampFee: 0.5, cexFee: 0.25, cryptoComFee: 0.5, bitflyerFee: 0.1, okxFee: 0.5, binanceUsFee: 0.02, buffer: 0.1,
   // Gaps wider than this almost always mean the two books are not interchangeable (transfers
   // paused, a different token, a halted market), so they are flagged and never paper-traded.
   maxGap: 2,
@@ -73,7 +75,7 @@ export function routesFor(snapshot: Snapshot | null, settings: Settings, balance
   const fee: Record<Venue, number> = {
     Coinbase: settings.coinbaseFee, Kraken: settings.krakenFee,
     Gemini: settings.geminiFee, Bitstamp: settings.bitstampFee, "CEX.IO": settings.cexFee, "Crypto.com": settings.cryptoComFee,
-    bitFlyer: settings.bitflyerFee, "OKX US": settings.okxFee,
+    bitFlyer: settings.bitflyerFee, "OKX US": settings.okxFee, "Binance.US": settings.binanceUsFee,
   };
   for (const symbol of universe.assets) {
     const book = snapshot.markets[symbol];
