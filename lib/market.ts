@@ -29,19 +29,28 @@ export const defaultUniverse: Universe = { assets: symbols.slice(0, 16), venues:
 // These US USD spot books are limited; don't request or count nonexistent pairs.
 const geminiUsd = new Set<SymbolName>(["BTC", "ETH", "SOL", "XRP", "DOGE", "LTC", "AVAX", "LINK", "BCH", "UNI", "AAVE", "DOT", "SHIB", "SUI", "PEPE", "ATOM", "TRX", "OP", "ARB", "FIL", "GRT", "POL", "ENS", "BONK", "BAT", "CRV", "FET", "JUP", "MANA", "XTZ"]);
 const cexUsd = new Set<SymbolName>(symbols.filter((symbol) => symbol !== "HBAR" && symbol !== "ETC"));
+const coinbaseUsd = new Set<SymbolName>(symbols.filter((symbol) => symbol !== "TRX" && symbol !== "JUP"));
+const bitstampUsd = new Set<SymbolName>(symbols.filter((symbol) => symbol !== "FIL" && symbol !== "ENS"));
+const cryptoComUsd = new Set<SymbolName>(symbols.filter((symbol) => symbol !== "TRX"));
 export const supportedPair = (symbol: SymbolName, venue: Venue) =>
   venue === "bitFlyer" ? symbol === "BTC" || symbol === "ETH" :
   venue === "OKX US" ? symbol === "BTC" || symbol === "ETH" || symbol === "SOL" :
   venue === "Gemini" ? geminiUsd.has(symbol) :
-  venue === "CEX.IO" ? cexUsd.has(symbol) : true;
+  venue === "CEX.IO" ? cexUsd.has(symbol) :
+  venue === "Coinbase" ? coinbaseUsd.has(symbol) :
+  venue === "Bitstamp" ? bitstampUsd.has(symbol) :
+  venue === "Crypto.com" ? cryptoComUsd.has(symbol) : true;
 export const feeKey: Record<Venue, keyof Settings> = {
   Coinbase: "coinbaseFee", Kraken: "krakenFee", Gemini: "geminiFee", Bitstamp: "bitstampFee", "CEX.IO": "cexFee", "Crypto.com": "cryptoComFee", bitFlyer: "bitflyerFee", "OKX US": "okxFee",
 };
-// Editable assumptions, not promises of an account's actual fee tier.
+// Editable assumptions, not promises of an account's actual fee tier. Entry-tier spot taker
+// rates as of September 2026: Coinbase Advanced (US) 0.90%, Gemini ActiveTrader 1.20%.
 export const defaults: Settings = {
-  budget: 50, minNet: 0.25, coinbaseFee: 0.6, krakenFee: 0.8,
-  geminiFee: 0.4, bitstampFee: 0.5, cexFee: 0.25, cryptoComFee: 0.5, bitflyerFee: 0.1, okxFee: 0.5, buffer: 0.1,
+  budget: 50, minNet: 0.25, coinbaseFee: 0.9, krakenFee: 0.8,
+  geminiFee: 1.2, bitstampFee: 0.5, cexFee: 0.25, cryptoComFee: 0.5, bitflyerFee: 0.1, okxFee: 0.5, buffer: 0.1,
 };
+export const settingRange = (key: keyof Settings): [number, number] =>
+  key === "budget" ? [5, 100000] : key === "minNet" ? [0, 10000] : [0, 10];
 export const newSession: Session = { balance: 500, scans: 0, tradeCount: 0, trades: [] };
 export const money = (n: number, digits = 2) => new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", minimumFractionDigits: digits, maximumFractionDigits: digits }).format(n);
 export const signedMoney = (n: number) => `${n >= 0 ? "+" : "−"}${money(Math.abs(n))}`;
