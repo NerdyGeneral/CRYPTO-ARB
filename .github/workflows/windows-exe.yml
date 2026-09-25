@@ -1,0 +1,76 @@
+name: Windows paper engine
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  exe:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.22.2
+
+      - name: Install dependencies
+        run: |
+          corepack enable
+          pnpm install --frozen-lockfile
+
+      - name: Typecheck and lint
+        run: |
+          pnpm exec tsc --noEmit
+          pnpm lint
+
+      - name: Build ArbiterPaper.exe
+        run: pnpm build:exe
+
+      - name: Smoke test the exe
+        shell: pwsh
+        run: |
+          $env:ARBITER_NO_BROWSER = "1"
+          $env:ARBITER_DATA_DIR = Join-Path $env:RUNNER_TEMP "arbiter-data"
+          $proc = Start-Process -FilePath release\ArbiterPaper.exe -PassThru -NoNewWindow `
+            -RedirectStandardOutput engine-out.txt -RedirectStandardError engine-err.txt
+          Start-Sleep -Seconds 75
+          try { $state = Invoke-RestMethod http://127.0.0.1:4173/api/state }
+          finally { Get-Content engine-out.txt, engine-err.txt | Write-Host }
+          $state.feeds | Format-Table venue, live, pairs, streaming, streamQuotes, restQuotes, restErrors | Out-String | Write-Host
+          $live = ($state.feeds | Measure-Object -Property live -Sum).Sum
+          $pairs = ($state.feeds | Measure-Object -Property pairs -Sum).Sum
+          $streaming = @($state.feeds | Where-Object { $_.streaming }).Count
+          $helper = Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" | Where-Object { $_.ParentProcessId -eq $proc.Id }
+          Write-Host "Live pairs $live/$pairs, streaming exchanges $streaming, scans $($state.session.scans), keep-awake helper running: $([bool]$helper)"
+          Stop-Process -Id $proc.Id
+          if ($live -lt [math]::Floor($pairs * 0.8)) { throw "Too few live pairs" }
+          if ($streaming -lt 3) { throw "Expected at least 3 streaming exchanges" }
+          if ($state.session.scans -lt 10) { throw "Engine is not scanning" }
+          if (-not $helper) { throw "Keep-awake helper did not start" }
+          # The helper must release the PC once the engine is gone.
+          Start-Sleep -Seconds 30
+          if (Get-Process -Id $helper.ProcessId -ErrorAction SilentlyContinue) { throw "Keep-awake helper outlived the engine" }
+          if (-not (Test-Path (Join-Path $env:ARBITER_DATA_DIR "config.json"))) { throw "Data folder was not created" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ArbiterPaper-windows
+          path: release/ArbiterPaper.exe
+
+      - name: Publish latest build
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view paper-engine-latest >/dev/null 2>&1 || gh release create paper-engine-latest --prerelease \
+            --title "Arbiter paper engine (latest)" --target "$GITHUB_SHA" \
+            --notes "Windows build of the background paper-trading engine from main. Simulated trades only; no orders are placed."
+          gh release upload paper-engine-latest release/ArbiterPaper.exe --clobber
