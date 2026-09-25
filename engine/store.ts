@@ -15,6 +15,8 @@ export type EngineConfig = {
   port: number;
   openBrowser: boolean;
   keepAwake: boolean;
+  // Windows only: a shortcut in the Startup folder opens the engine at sign-in, e.g. after an update restart.
+  startWithWindows: boolean;
   startingBalance: number;
   venues: Venue[];
   // The most-traded coins listed on at least two exchanges, plus any extras, minus any excluded.
@@ -32,6 +34,13 @@ export type SessionFile = {
   startedAt: number; startingBalance: number; balance: number; scans: number; tradeCount: number;
   // Shadow mode: the same trades replayed against the books one round trip later.
   shadowSince: number; shadow: ShadowTally;
+  // The hour in progress, so a restart doesn't lose it.
+  hour?: HourState;
+};
+
+export type HourState = {
+  start: number; scans: number; trades: number; pnl: number; quotes: number; scanMs: number; scanCount: number;
+  bestNetPct: number | null; bestTriangleNetPct: number | null; bestGrossPct: number | null; suspectKeys: string[]; shadow: ShadowTally;
 };
 
 export type ShadowRecord = ShadowResult & { time: number; path: string; kind: string; latencyMs: number };
@@ -51,6 +60,7 @@ export const defaultConfig: EngineConfig = {
   port: 4173,
   openBrowser: true,
   keepAwake: true,
+  startWithWindows: false,
   startingBalance: 500,
   venues: venues.filter((venue) => venue !== "Crypto.com"),
   topCoins: 150,
@@ -86,6 +96,7 @@ export function normalizeConfig(raw: unknown): EngineConfig {
     port: number(saved.port, defaultConfig.port, 1024, 65535),
     openBrowser: bool(saved.openBrowser, defaultConfig.openBrowser),
     keepAwake: bool(saved.keepAwake, defaultConfig.keepAwake),
+    startWithWindows: bool(saved.startWithWindows, defaultConfig.startWithWindows),
     startingBalance: number(saved.startingBalance, defaultConfig.startingBalance, 10, 10_000_000),
     venues: chosenVenues.length >= 2 ? chosenVenues : defaultConfig.venues,
     topCoins: Math.round(number(saved.topCoins, defaultConfig.topCoins, 1, 500)),
@@ -164,11 +175,15 @@ export class Store {
     if (!saved || ![saved.startedAt, saved.balance, saved.scans, saved.tradeCount].every(valid)) return fresh;
     // Sessions from before shadow mode start their shadow tally now; ones from before a stored starting
     // balance keep measuring from the configured one.
-    const tally = saved.shadow && Object.keys(emptyTally()).every((key) => valid(saved.shadow![key as keyof ShadowTally])) ? saved.shadow : null;
+    const isTally = (t: unknown): t is ShadowTally => !!t && Object.keys(emptyTally()).every((key) => valid((t as ShadowTally)[key as keyof ShadowTally]));
+    const tally = isTally(saved.shadow) ? saved.shadow : null;
+    const h = saved.hour;
+    const hour = h && [h.start, h.scans, h.trades, h.pnl, h.quotes, h.scanMs, h.scanCount].every(valid) && Array.isArray(h.suspectKeys) && isTally(h.shadow)
+      && [h.bestNetPct, h.bestTriangleNetPct, h.bestGrossPct].every((n) => n === null || valid(n)) ? h : undefined;
     return {
       startedAt: saved.startedAt!, startingBalance: valid(saved.startingBalance) ? saved.startingBalance : startingBalance,
       balance: saved.balance!, scans: saved.scans!, tradeCount: saved.tradeCount!,
-      shadowSince: tally && valid(saved.shadowSince) ? saved.shadowSince : fresh.shadowSince, shadow: tally || emptyTally(),
+      shadowSince: tally && valid(saved.shadowSince) ? saved.shadowSince : fresh.shadowSince, shadow: tally || emptyTally(), hour,
     };
   }
 

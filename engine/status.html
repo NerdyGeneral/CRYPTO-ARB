@@ -209,6 +209,7 @@
       <div class="legend"><span><i class="v-different-tokens"></i>Different tokens</span><span><i class="v-transfers-blocked"></i>Transfers closed</span><span><i class="v-price-anomaly"></i>Price outlier</span><span><i class="v-no-barrier-found"></i>No barrier found</span><span><i class="v-unverified"></i>Couldn't verify</span></div>
       <div class="vrow"><b id="suspectBarLabel">Suspect gaps (above the limit, never traded)</b><div id="suspectBar"></div></div>
       <div class="vrow"><b id="tradedBarLabel">Paper-traded routes (under the limit)</b><div id="tradedBar"></div></div>
+      <div class="vrow"><b>Blocked from paper trading</b><p class="hint" style="margin:0" id="barrierList"></p></div>
       <p class="sub">A suspect with no barrier found means the rule may have been too cautious. A traded route with a barrier means it wasn't cautious enough: with money already on both exchanges one trade still goes through, but closed transfers or a different token stop you rebalancing, so the gap can't be repeated.</p>
     </section>
   </div>
@@ -248,6 +249,7 @@
         <div class="fields">
           <label class="check"><input type="checkbox" name="keepAwake"> Keep the PC awake while running</label>
           <label class="check"><input type="checkbox" name="openBrowser"> Open this page when the engine starts</label>
+          <label class="check" id="autostartField"><input type="checkbox" name="startWithWindows"> Start automatically when I sign in to Windows <span class="muted" id="autostartNote">(opens minimized, so it comes back after an update restart)</span></label>
           <label class="field">Dashboard port<input type="number" name="port" step="1" min="1024" max="65535"><small>Takes effect after a restart.</small></label>
         </div>
       </fieldset>
@@ -378,6 +380,10 @@
     $("aTradedSub").textContent = decided(v.traded) ? `${barriers(v.traded)} of ${decided(v.traded)} checked` + (a.tradedPending ? `; ${a.tradedPending} waiting` : "") :
       a.tradedPending ? `${a.tradedPending} waiting to be checked` : "no cross-exchange trades yet";
     $("ruleNote").textContent = `Every suspect gap (raw gap above ${s.settings.maxGap}%) is checked for different tokens, closed transfers and price outliers, and so is every cross-exchange route that was paper-traded. Checks run one at a time, about every 20 seconds, and are saved to verdicts.csv.`;
+    $("barrierList").innerHTML = a.barriers.length
+      ? "A barrier found by a check blocks that coin between those two exchanges at any gap, until a later check finds none: " +
+        a.barriers.map((b) => `<span class="badge ${b.reason === "price outlier" ? "warning" : "blocked"}">${esc(b.coin)} ${esc(b.buy)} → ${esc(b.sell)}: ${esc(b.reason)}</span>`).join(" ")
+      : "Nothing yet. When a check finds different tokens, closed transfers or an outlier price, that coin between those two exchanges is blocked at any gap.";
     $("suspectBar").innerHTML = verdictBar(v.suspect);
     $("tradedBar").innerHTML = verdictBar(v.traded);
     if (activeTab === "accuracy") renderCharts(s);
@@ -541,6 +547,7 @@
     if (loadedSettings && !force) return;
     try { schema = await (await fetch("/api/config", { cache: "no-store" })).json(); } catch { $("saveResult").textContent = "Engine not reachable."; return; }
     fill(schema.config);
+    if (!schema.autostartAvailable) { form.elements.startWithWindows.disabled = true; $("autostartNote").textContent = "(only in the Windows exe)"; }
     loadedSettings = true;
   }
   $("loadDefaults").onclick = () => { if (schema) { fill({ ...schema.defaults, port: schema.config.port }); $("saveResult").textContent = "Defaults loaded. Save to apply them."; $("saveResult").className = "muted"; } };
@@ -564,6 +571,8 @@
     if (result.adjusted.length) notes.push(`Out-of-range values were reset to their defaults: ${result.adjusted.join(", ")}.`);
     if (result.reloadingMarkets) notes.push("Reloading coins and exchanges…");
     if (result.onRestart.length) notes.push(`Restart the engine for ${result.onRestart.join(", ")} to take effect.`);
+    if (result.autostart === true) notes.push("It will start when you sign in to Windows.");
+    if (result.autostart === false && result.config.startWithWindows) notes.push("Couldn't add it to Windows startup.");
     $("saveResult").textContent = notes.join(" "); $("saveResult").className = result.adjusted.length ? "warn" : "pos";
     refresh();
   });

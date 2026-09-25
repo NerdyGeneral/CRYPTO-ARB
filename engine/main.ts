@@ -1,5 +1,8 @@
 import { spawn } from "node:child_process";
+import fs from "node:fs";
 import http from "node:http";
+import path from "node:path";
+import { isSea } from "node:sea";
 import statusPage from "./status.html";
 import { Engine } from "./engine";
 import { Store, defaultConfig, resolveDataDir } from "./store";
@@ -24,20 +27,68 @@ function openBrowser() {
   child.unref();
 }
 
-// Windows sleeps an idle PC after a few minutes, which would stop scanning. A hidden PowerShell
-// helper holds a "system required" request for as long as this process lives, then exits on its own.
-function keepAwake(): () => void {
-  if (process.platform !== "win32" || !config.keepAwake) return () => {};
+function powershell(script: string, options: { attachConsole?: boolean } = {}) {
+  // A helper without its own window shares this console when there is one, so it can change its settings.
+  return spawn("powershell.exe", ["-NoProfile", "-NonInteractive", "-EncodedCommand", Buffer.from(script, "utf16le").toString("base64")],
+    { stdio: "ignore", windowsHide: !options.attachConsole });
+}
+
+// One hidden PowerShell helper for two Windows problems:
+//  - Clicking in a console window starts a text selection ("QuickEdit") that pauses the app writing to it,
+//    which would freeze scanning until a key is pressed; the helper turns QuickEdit off for this console.
+//  - Windows sleeps an idle PC after a few minutes; the helper holds a "system required" request for as long
+//    as this process lives, then exits on its own.
+function windowsHelper(): () => void {
+  if (process.platform !== "win32") return () => {};
   const script = [
-    "$sig = '[DllImport(\"kernel32.dll\")] public static extern uint SetThreadExecutionState(uint esFlags);'",
-    "$api = Add-Type -MemberDefinition $sig -Name Power -Namespace Arbiter -PassThru",
-    "$null = $api::SetThreadExecutionState([uint32]2147483649)", // ES_CONTINUOUS | ES_SYSTEM_REQUIRED
-    `while (Get-Process -Id ${process.pid} -ErrorAction SilentlyContinue) { Start-Sleep -Seconds 20 }`,
+    "$sig = @'",
+    '[DllImport("kernel32.dll")] public static extern uint SetThreadExecutionState(uint esFlags);',
+    '[DllImport("kernel32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr CreateFile(string name, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template);',
+    '[DllImport("kernel32.dll")] public static extern bool GetConsoleMode(IntPtr handle, out uint mode);',
+    '[DllImport("kernel32.dll")] public static extern bool SetConsoleMode(IntPtr handle, uint mode);',
+    "'@",
+    "$api = Add-Type -MemberDefinition $sig -Name Win32 -Namespace Arbiter -PassThru",
+    // CONIN$ is this console's input; clear ENABLE_QUICK_EDIT_MODE (0x40), set ENABLE_EXTENDED_FLAGS (0x80).
+    "try {",
+    "  $in = $api::CreateFile('CONIN$', 0xC0000000, 3, [IntPtr]::Zero, 3, 0, [IntPtr]::Zero)",
+    "  $mode = [uint32]0",
+    "  if ($api::GetConsoleMode($in, [ref]$mode)) { $null = $api::SetConsoleMode($in, [uint32](($mode -band 0xFFBF) -bor 0x80)) }",
+    "} catch {}",
+    ...(config.keepAwake ? [
+      "$null = $api::SetThreadExecutionState([uint32]2147483649)", // ES_CONTINUOUS | ES_SYSTEM_REQUIRED
+      `while (Get-Process -Id ${process.pid} -ErrorAction SilentlyContinue) { Start-Sleep -Seconds 20 }`,
+    ] : []),
   ].join("\n");
-  const child = spawn("powershell.exe", ["-NoProfile", "-NonInteractive", "-EncodedCommand", Buffer.from(script, "utf16le").toString("base64")],
-    { stdio: "ignore", windowsHide: true });
-  child.on("error", () => console.log("Could not keep the PC awake; set Windows sleep to Never while this runs."));
+  const child = powershell(script, { attachConsole: Boolean(process.stdout.isTTY) });
+  child.on("error", () => { if (config.keepAwake) console.log("Could not keep the PC awake; set Windows sleep to Never while this runs."); });
   return () => { child.kill(); };
+}
+
+// "Start with Windows" is a shortcut in the user's Startup folder that opens the exe minimized at sign-in.
+// It is rewritten on every start so it follows the exe if the folder is moved.
+const startupShortcut = process.env.APPDATA ? path.join(process.env.APPDATA, "Microsoft", "Windows", "Start Menu", "Programs", "Startup", "Arbiter Paper Engine.lnk") : null;
+const autostartAvailable = process.platform === "win32" && isSea() && startupShortcut !== null;
+
+function syncAutostart(enabled: boolean): Promise<boolean> {
+  if (!autostartAvailable || !startupShortcut) return Promise.resolve(false);
+  if (!enabled) {
+    try { fs.rmSync(startupShortcut, { force: true }); } catch { /* Already gone. */ }
+    return Promise.resolve(false);
+  }
+  const quote = (text: string) => `'${text.replace(/'/g, "''")}'`;
+  const script = [
+    `$link = (New-Object -ComObject WScript.Shell).CreateShortcut(${quote(startupShortcut)})`,
+    `$link.TargetPath = ${quote(process.execPath)}`,
+    `$link.WorkingDirectory = ${quote(path.dirname(process.execPath))}`,
+    "$link.WindowStyle = 7", // minimized
+    "$link.Description = 'Arbiter paper engine (simulated trades only)'",
+    "$link.Save()",
+  ].join("\n");
+  return new Promise((resolve) => {
+    const child = powershell(script);
+    child.on("error", () => resolve(false));
+    child.on("exit", () => resolve(fs.existsSync(startupShortcut)));
+  });
 }
 
 function readBody(request: http.IncomingMessage): Promise<unknown> {
@@ -61,7 +112,7 @@ const server = http.createServer(async (request, response) => {
   if (request.method === "GET" && path === "/api/state") return send(200, "application/json", JSON.stringify(engine.state()));
   if (request.method === "GET" && path === "/api/config") {
     const ranges = Object.fromEntries(Object.keys(defaultConfig.settings).map((key) => [key, settingRange(key as keyof Settings)]));
-    return send(200, "application/json", JSON.stringify({ config: engine.currentConfig, defaults: defaultConfig, ranges }));
+    return send(200, "application/json", JSON.stringify({ config: engine.currentConfig, defaults: defaultConfig, ranges, autostartAvailable }));
   }
   // Controls need a custom header, which a page on another site cannot send without a preflight this server never approves.
   if (request.method === "POST" && request.headers["x-arbiter"] === "1") {
@@ -75,9 +126,12 @@ const server = http.createServer(async (request, response) => {
     if (path === "/api/config") {
       const body = await readBody(request);
       if (!body || typeof body !== "object" || Array.isArray(body)) return send(400, "application/json", '{"error":"expected an object"}');
+      const before = engine.currentConfig.startWithWindows;
       const result = engine.updateConfig(body as Record<string, unknown>);
-      console.log(`${new Date().toLocaleTimeString()}  Settings saved from the dashboard${result.reloadingMarkets ? "; reloading markets" : ""}`);
-      return send(200, "application/json", JSON.stringify(result));
+      const autostart = result.config.startWithWindows !== before ? await syncAutostart(result.config.startWithWindows) : null;
+      console.log(`${new Date().toLocaleTimeString()}  Settings saved from the dashboard${result.reloadingMarkets ? "; reloading markets" : ""}` +
+        (autostart === null ? "" : autostart ? "; will start when you sign in to Windows" : "; won't start with Windows"));
+      return send(200, "application/json", JSON.stringify({ ...result, autostart }));
     }
     if (path === "/api/verify") {
       const body = await readBody(request) as { key?: unknown };
@@ -105,14 +159,15 @@ server.on("error", (error: NodeJS.ErrnoException) => {
 });
 
 server.listen(config.port, "127.0.0.1", async () => {
-  const releaseAwake = keepAwake();
+  const releaseHelper = windowsHelper();
+  void syncAutostart(engine.currentConfig.startWithWindows);
   let stopping = false;
   const shutdown = (signal: string) => {
     if (stopping) return;
     stopping = true;
     console.log(`\n${signal}: saving paper session and stopping.`);
     engine.stop();
-    releaseAwake();
+    releaseHelper();
     server.close();
     process.exit(0);
   };
