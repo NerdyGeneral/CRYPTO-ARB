@@ -17,10 +17,12 @@ const REDISCOVER_MS = 12 * 60 * 60 * 1000;
 const QUOTE_TTL_MS = 12_000;
 // Crypto.com's USD books are a USD bundle, so its routes are shown but never paper-traded.
 const INDICATIVE: Venue[] = ["Crypto.com"];
+// CEX.IO's public API allows about 100 requests a minute per IP, so only its highest-volume books are followed.
+const MAX_BOOKS_PER_VENUE: Partial<Record<Venue, number>> = { "CEX.IO": 80 };
 
 // Per-market REST budget per venue in requests per second, well under each exchange's public limit.
 const restRate: Record<Venue, number> = {
-  Coinbase: 4, Kraken: 1, Gemini: 1.5, Bitstamp: 4, "CEX.IO": 0.5, bitFlyer: 1, "OKX US": 4, "Crypto.com": 4, "Binance.US": 4,
+  Coinbase: 4, Kraken: 1, Gemini: 1.5, Bitstamp: 4, "CEX.IO": 0.2, bitFlyer: 1, "OKX US": 4, "Crypto.com": 4, "Binance.US": 4,
 };
 
 type VenueStats = { streamQuotes: number; restQuotes: number; restErrors: number; lastStreamAt: number; lastQuoteAt: number };
@@ -113,6 +115,7 @@ export class Engine {
       const selection = selectMarkets(listing, {
         tradableVenues: this.config.venues.filter((venue) => !INDICATIVE.includes(venue)), topCoins: this.config.topCoins,
         include: this.config.extraCoins, exclude: this.config.excludeCoins, triangular: this.config.triangular,
+        maxPerVenue: MAX_BOOKS_PER_VENUE,
       });
       this.markets = selection.markets.filter((market) => this.config.venues.includes(market.venue));
       this.coverage = { coins: selection.coins, markets: this.markets.length, fetchedAt: listing.fetchedAt, source, errors: listing.errors };

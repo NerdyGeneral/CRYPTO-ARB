@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { defaults, emptyMarkets, routesFor, type Quote, type Settings } from "../lib/market";
 import { keyOf, makeMarket, type Market } from "../lib/markets";
+import { selectMarkets } from "../lib/discovery";
 import { chooseTrade, scanOpportunities, type Opportunity } from "../lib/opportunities";
 
 const now = 1_000_000;
@@ -101,4 +102,22 @@ test("a paper trade cannot fill twice against the same unchanged quote", () => {
   assert.equal(chooseTrade([route("b", 0.02881, 900)], memory, { ...options, now: now + 2000 })?.key, "b");
   // Routes below the minimum are skipped.
   assert.equal(chooseTrade([route("c", 0.03, 10, 0.1)], memory, options), null);
+});
+
+test("market selection ranks coins by volume, needs two venues and caps books per venue", () => {
+  const markets = [
+    ...["BTC", "ETH", "AAA", "BBB", "CCC"].flatMap((coin) => [makeMarket("Coinbase", coin, "USD"), makeMarket("CEX.IO", coin, "USD"), makeMarket("CEX.IO", coin, "USDT")]),
+    makeMarket("Kraken", "LONE", "USD"),               // listed on one venue only
+    makeMarket("Kraken", "USDT", "USD"),               // stablecoin rate book
+    makeMarket("Kraken", "ETH", "BTC"),                // cross book for triangles
+  ];
+  const volumeUsd = { BTC: 100, ETH: 90, AAA: 5, BBB: 50, CCC: 1, LONE: 1000 };
+  const selection = selectMarkets({ markets, volumeUsd, fetchedAt: now, errors: [] },
+    { tradableVenues: ["Coinbase", "CEX.IO", "Kraken"], topCoins: 3, triangular: true, maxPerVenue: { "CEX.IO": 4 } });
+  assert.deepEqual(selection.coins, ["BTC", "ETH", "BBB"]);
+  const cex = selection.markets.filter((m) => m.venue === "CEX.IO").map((m) => `${m.base}/${m.quote}`);
+  assert.deepEqual(cex, ["BTC/USD", "BTC/USDT", "ETH/USD", "ETH/USDT"]);
+  assert.ok(selection.markets.some((m) => m.base === "USDT" && m.quote === "USD"));
+  assert.ok(selection.markets.some((m) => m.base === "ETH" && m.quote === "BTC"));
+  assert.ok(!selection.markets.some((m) => m.base === "LONE" || m.base === "AAA"));
 });

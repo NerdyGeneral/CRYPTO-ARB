@@ -24,7 +24,7 @@ The web page only scans while it is open and visible. `ArbiterPaper.exe` runs th
 2. A console window opens and the dashboard opens in your browser at `http://127.0.0.1:4173`. Keep the console window open; closing it stops the engine (progress is saved).
 3. While it runs, it asks Windows not to sleep. The screen can still turn off. Leave the PC plugged in.
 
-**What it scans.** On start (and every 12 hours) it reads each exchange's public listings and picks the 150 most-traded coins listed on at least two of Coinbase, Kraken, Gemini, Bitstamp, CEX.IO, Binance.US, bitFlyer and OKX US: about 1,100 order books priced in USD, USDT, USDC and, for triangles, BTC and ETH. If the exchanges can't be reached it uses the last saved listings.
+**What it scans.** On start (and every 12 hours) it reads each exchange's public listings and picks the 150 most-traded coins listed on at least two of Coinbase, Kraken, Gemini, Bitstamp, CEX.IO, Binance.US, bitFlyer and OKX US: about 850 order books priced in USD, USDT, USDC and, for triangles, BTC and ETH. CEX.IO is limited to its 80 highest-volume books because its public API allows about 100 requests a minute. If the exchanges can't be reached it uses the last saved listings.
 
 **Routes it evaluates:**
 
@@ -48,7 +48,7 @@ Every estimate includes each exchange's entry-tier taker fee, conversion costs a
 
 Routes whose raw gap is above `maxGap` (default 2%) are shown as suspect and never traded. Gaps that large almost always mean the two listings cannot be arbitraged, for example because transfers are paused or they are different tokens.
 
-Scanning about 1,100 order books uses roughly half of one CPU core and 250 MB of memory.
+Scanning uses roughly half of one CPU core and 250 MB of memory.
 
 For development, `pnpm engine` bundles and runs the engine with Node without packaging it.
 

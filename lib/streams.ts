@@ -54,11 +54,12 @@ const streamUrl: Record<Venue, string | null> = {
   bitFlyer: null, // REST only
 };
 
-// CEX.IO answers "API rate limit reached" and disconnects when one IP subscribes faster than a few books a
-// second, across all of its sockets; Bitstamp takes one subscribe message per book. Both are paced through a
-// single queue per venue, shared by every socket, and CEX.IO books are spread over sockets of 60.
-const maxPerSocket: Partial<Record<Venue, number>> = { "CEX.IO": 60, "Binance.US": 1000 };
-const subscribeGapMs: Partial<Record<Venue, number>> = { "CEX.IO": 250, Bitstamp: 25 };
+// CEX.IO limits each IP to about 100 requests a minute (subscribes and pings included) and answers
+// "API rate limit reached" then disconnects; Bitstamp takes one subscribe message per book. Both are paced
+// through one queue per venue shared by every socket: CEX.IO at one subscribe a second on a single socket,
+// which with its ping every 8s stays near 70 requests a minute.
+const maxPerSocket: Partial<Record<Venue, number>> = { "CEX.IO": 100, "Binance.US": 1000 };
+const subscribeGapMs: Partial<Record<Venue, number>> = { "CEX.IO": 1000, Bitstamp: 25 };
 const pause = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const nextSlot = new Map<Venue, number>();
 // Reserves the venue's next send slot and returns how long to wait for it.

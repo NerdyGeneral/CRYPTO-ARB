@@ -121,6 +121,8 @@ export type Selection = { coins: string[]; markets: Market[] };
 // dollar stablecoins' own USD books are always included because every conversion and triangle needs them.
 export function selectMarkets(listing: Listing, options: {
   tradableVenues: Venue[]; topCoins: number; include?: string[]; exclude?: string[]; triangular: boolean;
+  // Most books to follow on a venue, keeping its highest-volume ones.
+  maxPerVenue?: Partial<Record<Venue, number>>;
 }): Selection {
   const exclude = new Set(options.exclude || []);
   const venuesByCoin = new Map<string, Set<Venue>>();
@@ -146,5 +148,11 @@ export function selectMarkets(listing: Listing, options: {
   // Most-traded first, so venues that subscribe slowly (CEX.IO) bring the important books up first.
   const rank = (m: Market) => isDollarStable(m.base) ? -1 : coins.indexOf(m.base);
   markets.sort((a, b) => rank(a) - rank(b));
-  return { coins, markets };
+  const perVenue = new Map<Venue, number>();
+  const capped = markets.filter((m) => {
+    const count = (perVenue.get(m.venue) || 0) + 1;
+    perVenue.set(m.venue, count);
+    return count <= (options.maxPerVenue?.[m.venue] ?? Infinity);
+  });
+  return { coins, markets: capped };
 }
