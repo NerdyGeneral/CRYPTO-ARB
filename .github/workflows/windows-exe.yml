@@ -43,9 +43,15 @@ jobs:
             -RedirectStandardOutput engine-out.txt -RedirectStandardError engine-err.txt
           # CEX.IO allows about 100 requests a minute per IP, so its 80 books subscribe at one a second.
           Start-Sleep -Seconds 120
-          try { $state = Invoke-RestMethod http://127.0.0.1:4173/api/state }
+          try {
+            $state = Invoke-RestMethod http://127.0.0.1:4173/api/state
+            # The Settings tab saves through this endpoint; a request without the dashboard's header is refused.
+            $saved = Invoke-RestMethod -Method Post -Uri http://127.0.0.1:4173/api/config -Headers @{ 'X-Arbiter' = '1' } `
+              -ContentType 'application/json' -Body '{"settings":{"minNet":0.3}}'
+            $refused = Invoke-WebRequest -Method Post -Uri http://127.0.0.1:4173/api/config -ContentType 'application/json' -Body '{}' -SkipHttpErrorCheck
+          }
           finally { Get-Content engine-out.txt, engine-err.txt | Write-Host }
-          $state.feeds | Format-Table venue, live, markets, streaming, streamQuotes, restQuotes, restErrors | Out-String | Write-Host
+          $state.feeds | Format-Table venue, live, markets, streaming, streamQuotes, restQuotes, restErrors, latencyMs | Out-String | Write-Host
           $state.routes | Select-Object -First 8 | Format-Table kind, path, notional, grossPct, net | Out-String | Write-Host
           $live = ($state.feeds | Measure-Object -Property live -Sum).Sum
           $books = ($state.feeds | Measure-Object -Property markets -Sum).Sum
@@ -63,10 +69,16 @@ jobs:
           if (-not $state.rates.USDT) { throw "No live USDT/USD rate" }
           if ($state.session.scans -lt 10) { throw "Engine is not scanning" }
           if (-not $helper) { throw "Keep-awake helper did not start" }
+          if (@($state.feeds | Where-Object { $_.latencyMeasured }).Count -lt 5) { throw "Exchange latency was not measured" }
+          if ($null -eq $state.shadow -or $null -eq $state.accuracy) { throw "Shadow and accuracy figures are missing" }
+          if ($saved.config.settings.minNet -ne 0.3) { throw "Settings were not saved through the dashboard API" }
+          if ($refused.StatusCode -ne 404) { throw "A settings change without the dashboard header was accepted" }
           # The helper must release the PC once the engine is gone.
           Start-Sleep -Seconds 30
           if (Get-Process -Id $helper.ProcessId -ErrorAction SilentlyContinue) { throw "Keep-awake helper outlived the engine" }
-          if (-not (Test-Path (Join-Path $env:ARBITER_DATA_DIR "config.json"))) { throw "Data folder was not created" }
+          $configFile = Join-Path $env:ARBITER_DATA_DIR "config.json"
+          if (-not (Test-Path $configFile)) { throw "Data folder was not created" }
+          if ((Get-Content $configFile -Raw | ConvertFrom-Json).settings.minNet -ne 0.3) { throw "Saved settings did not reach config.json" }
 
       - uses: actions/upload-artifact@v4
         with:

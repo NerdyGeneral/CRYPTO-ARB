@@ -14,8 +14,12 @@ export const MAX_LEG_SKEW_MS = 4_000;
 const RATE_TTL_MS = 60_000;
 const MIN_NOTIONAL = 5;
 
-// `market` and `size` identify the exact top-of-book quote a leg would trade against.
-export type Leg = { venue: Venue; pair: string; side: "buy" | "sell"; price: number; market: string; size: number };
+// `market` and `size` identify the exact top-of-book quote a leg would trade against; `qty` is the order size
+// in base units and `fee` the taker fee as a fraction, used to replay the order against later books.
+export type Leg = {
+  venue: Venue; pair: string; base: string; quote: string; side: "buy" | "sell"; price: number;
+  market: string; size: number; qty: number; fee: number;
+};
 export type Opportunity = {
   key: string; kind: "cross" | "triangle"; coin: string; venues: Venue[]; path: string; legs: Leg[];
   notional: number; grossPct: number; net: number; netPct: number;
@@ -124,8 +128,8 @@ export function scanOpportunities(input: ScanInput): ScanResult {
         key: `cross|${coin}|${keyOf(a.m)}>${keyOf(b.m)}`, kind: "cross", coin, venues: [a.m.venue, b.m.venue],
         path: `${coin}: ${a.m.venue} (${a.m.quote}) → ${b.m.venue} (${b.m.quote})`,
         legs: [
-          { venue: a.m.venue, pair: `${coin}/${a.m.quote}`, side: "buy", price: a.q.ask, market: keyOf(a.m), size: a.q.askSize },
-          { venue: b.m.venue, pair: `${coin}/${b.m.quote}`, side: "sell", price: b.q.bid, market: keyOf(b.m), size: b.q.bidSize },
+          { venue: a.m.venue, pair: `${coin}/${a.m.quote}`, base: coin, quote: a.m.quote, side: "buy", price: a.q.ask, market: keyOf(a.m), size: a.q.askSize, qty, fee: a.fee },
+          { venue: b.m.venue, pair: `${coin}/${b.m.quote}`, base: coin, quote: b.m.quote, side: "sell", price: b.q.bid, market: keyOf(b.m), size: b.q.bidSize, qty, fee: b.fee },
         ],
         notional, grossPct, net, netPct: net / notional * 100, fees, conversion, buffer,
         ageMs: now - Math.min(a.at, b.at), suspect,
@@ -135,7 +139,7 @@ export function scanOpportunities(input: ScanInput): ScanResult {
 
   // Triangles: USD -> A -> C -> USD on one venue, over every book it lists.
   if (input.triangular) {
-    type Edge = { to: string; rate: number; raw: number; capacity: number; m: Market; q: Quote; side: "buy" | "sell" };
+    type Edge = { to: string; rate: number; raw: number; capacity: number; fee: number; m: Market; q: Quote; side: "buy" | "sell" };
     const graphs = new Map<Venue, Map<string, Edge[]>>();
     for (const m of markets) {
       const q = fresh(m);
@@ -145,8 +149,8 @@ export function scanOpportunities(input: ScanInput): ScanResult {
       graphs.set(m.venue, graph);
       const out = (from: string, edge: Edge) => { const list = graph.get(from); if (list) list.push(edge); else graph.set(from, [edge]); };
       // Spending the quote currency buys base at the ask; capacity is in quote units.
-      out(m.quote, { to: m.base, rate: (1 - fee) / q.ask, raw: 1 / q.ask, capacity: q.askSize * q.ask, m, q, side: "buy" });
-      out(m.base, { to: m.quote, rate: q.bid * (1 - fee), raw: q.bid, capacity: q.bidSize, m, q, side: "sell" });
+      out(m.quote, { to: m.base, rate: (1 - fee) / q.ask, raw: 1 / q.ask, capacity: q.askSize * q.ask, fee, m, q, side: "buy" });
+      out(m.base, { to: m.quote, rate: q.bid * (1 - fee), raw: q.bid, capacity: q.bidSize, fee, m, q, side: "sell" });
     }
     for (const [venue, graph] of graphs) {
       const toUsd = new Map<string, Edge>();
@@ -171,11 +175,15 @@ export function scanOpportunities(input: ScanInput): ScanResult {
           const suspect = grossPct > settings.maxGap;
           if (!suspect && net <= top.floor() && best && net <= (best as Opportunity).net) continue;
           if (suspect && grossPct <= suspects.floor()) continue;
-          const legOf = (e: Edge): Leg => ({ venue, pair: `${e.m.base}/${e.m.quote}`, side: e.side, price: e.side === "buy" ? e.q.ask : e.q.bid,
-            market: keyOf(e.m), size: e.side === "buy" ? e.q.askSize : e.q.bidSize });
+          // Amounts along the path; a buy's order size is what it receives, a sell's is what it spends.
+          const a1 = size * e1.rate, a2 = a1 * e2.rate;
+          const legOf = (e: Edge, amountIn: number, amountOut: number): Leg => ({
+            venue, pair: `${e.m.base}/${e.m.quote}`, base: e.m.base, quote: e.m.quote, side: e.side, price: e.side === "buy" ? e.q.ask : e.q.bid,
+            market: keyOf(e.m), size: e.side === "buy" ? e.q.askSize : e.q.bidSize, qty: e.side === "buy" ? amountOut : amountIn, fee: e.fee,
+          });
           consider({
             key: `tri|${venue}|USD>${e1.to}>${e2.to}|${e2.m.base}/${e2.m.quote}`, kind: "triangle", coin: [e1.to, e2.to].filter((c) => !isDollarStable(c)).join("/") || e1.to,
-            venues: [venue], path: `${venue}: USD → ${e1.to} → ${e2.to} → USD`, legs: [legOf(e1), legOf(e2), legOf(e3)],
+            venues: [venue], path: `${venue}: USD → ${e1.to} → ${e2.to} → USD`, legs: [legOf(e1, size, a1), legOf(e2, a1, a2), legOf(e3, a2, a2 * e3.rate)],
             notional: size, grossPct, net, netPct: net / size * 100, fees, conversion: 0, buffer,
             ageMs: now - Math.min(...times), suspect,
           });
@@ -194,19 +202,30 @@ export type TradeMemory = {
   consumed: Map<string, { price: number; size: number }>;
 };
 
-// Picks the first route (best net first) that clears the minimum, is off its cooldown, and does not
-// trade against a quote a previous paper trade already filled: a real fill takes that liquidity, so a
-// leg becomes available again only once the exchange shows a different price or size.
-export function chooseTrade(candidates: Opportunity[], memory: TradeMemory, options: { minNet: number; now: number; cooldownMs: number }): Opportunity | null {
-  const usedUp = (o: Opportunity) => o.legs.some((leg) => {
-    const used = memory.consumed.get(`${leg.market}|${leg.side}`);
-    return used !== undefined && used.price === leg.price && used.size === leg.size;
+export type TradeRules = { minNet: number; now: number; cooldownMs: number };
+
+// Why a route would not be paper-traded right now, or null if it would. The dashboard shows the same
+// reasons the bot applies.
+export function blockReason(o: Opportunity, memory: TradeMemory, rules: TradeRules): string | null {
+  if (o.suspect) return "Suspect gap";
+  if (o.net <= 0) return "Loses money after costs";
+  if (o.net < rules.minNet) return `Below your $${rules.minNet.toFixed(2)} minimum`;
+  if (rules.now - (memory.recent.get(o.key) ?? -Infinity) < rules.cooldownMs) return "Traded in the last minute";
+  // A real fill takes the quoted liquidity, so a leg cannot trade again against the same unchanged quote;
+  // it becomes available once the exchange shows a different price or size.
+  const used = o.legs.some((leg) => {
+    const entry = memory.consumed.get(`${leg.market}|${leg.side}`);
+    return entry !== undefined && entry.price === leg.price && entry.size === leg.size;
   });
-  const chosen = candidates.find((o) => o.net > 0 && o.net >= options.minNet && options.now - (memory.recent.get(o.key) ?? -Infinity) >= options.cooldownMs && !usedUp(o)) || null;
+  return used ? "Quote already used by a paper trade" : null;
+}
+
+// Picks the first route (best net first) that passes every rule, and records what it used.
+export function chooseTrade(candidates: Opportunity[], memory: TradeMemory, rules: TradeRules): Opportunity | null {
+  const chosen = candidates.find((o) => blockReason(o, memory, rules) === null) || null;
   if (chosen) {
-    memory.recent.set(chosen.key, options.now);
+    memory.recent.set(chosen.key, rules.now);
     for (const leg of chosen.legs) memory.consumed.set(`${leg.market}|${leg.side}`, { price: leg.price, size: leg.size });
   }
   return chosen;
 }
-
