@@ -25,10 +25,11 @@ jobs:
           corepack enable
           pnpm install --frozen-lockfile
 
-      - name: Typecheck and lint
+      - name: Typecheck, lint and unit tests
         run: |
           pnpm exec tsc --noEmit
           pnpm lint
+          pnpm test
 
       - name: Build ArbiterPaper.exe
         run: pnpm build:exe
@@ -43,15 +44,20 @@ jobs:
           Start-Sleep -Seconds 75
           try { $state = Invoke-RestMethod http://127.0.0.1:4173/api/state }
           finally { Get-Content engine-out.txt, engine-err.txt | Write-Host }
-          $state.feeds | Format-Table venue, live, pairs, streaming, streamQuotes, restQuotes, restErrors | Out-String | Write-Host
+          $state.feeds | Format-Table venue, live, markets, streaming, streamQuotes, restQuotes, restErrors | Out-String | Write-Host
+          $state.routes | Select-Object -First 8 | Format-Table kind, path, notional, grossPct, net | Out-String | Write-Host
           $live = ($state.feeds | Measure-Object -Property live -Sum).Sum
-          $pairs = ($state.feeds | Measure-Object -Property pairs -Sum).Sum
+          $books = ($state.feeds | Measure-Object -Property markets -Sum).Sum
           $streaming = @($state.feeds | Where-Object { $_.streaming }).Count
+          $binance = $state.feeds | Where-Object { $_.venue -eq 'Binance.US' }
           $helper = Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" | Where-Object { $_.ParentProcessId -eq $proc.Id }
-          Write-Host "Live pairs $live/$pairs, streaming exchanges $streaming, scans $($state.session.scans), keep-awake helper running: $([bool]$helper)"
+          Write-Host "Coins $($state.coverage.coins) ($($state.coverage.source)), live books $live/$books, streaming exchanges $streaming, Binance.US streaming: $($binance.streaming), USDT `$$($state.rates.USDT.mid), scans $($state.session.scans), keep-awake helper running: $([bool]$helper)"
           Stop-Process -Id $proc.Id
-          if ($live -lt [math]::Floor($pairs * 0.8)) { throw "Too few live pairs" }
-          if ($streaming -lt 3) { throw "Expected at least 3 streaming exchanges" }
+          if (-not $state.ready -or $state.coverage.source -ne 'live' -or $state.coverage.coins -lt 100) { throw "Market discovery did not complete" }
+          if ($live -lt [math]::Floor($books * 0.8)) { throw "Too few live order books" }
+          if ($streaming -lt 5) { throw "Expected at least 5 streaming exchanges" }
+          if (-not $binance.streaming) { throw "Binance.US is not streaming" }
+          if (-not $state.rates.USDT) { throw "No live USDT/USD rate" }
           if ($state.session.scans -lt 10) { throw "Engine is not scanning" }
           if (-not $helper) { throw "Keep-awake helper did not start" }
           # The helper must release the PC once the engine is gone.
