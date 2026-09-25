@@ -2,27 +2,36 @@ import type { Venue } from "./market";
 
 // Public first-tier spot taker schedules. Account tiers, negotiated pricing and
 // pair-specific promotions require authenticated account data and are not inferred here.
+// Coinbase is not read: its retail (Advanced) schedule blocks automated requests, and the
+// institutional Exchange schedule understates what retail accounts pay.
 export const publicFeeSources: Partial<Record<Venue, string>> = {
-  Coinbase: "https://help.coinbase.com/en/exchange/trading-and-funding/exchange-fees",
   Kraken: "https://www.kraken.com/features/fee-schedule",
-  Gemini: "https://www.gemini.com/cryptopedia/what-fees-do-crypto-exchanges-charge",
+  Gemini: "https://www.gemini.com/fees/activetrader-fee-schedule",
   "CEX.IO": "https://cex.io/en-US/buy-tether-usdt",
   bitFlyer: "https://bitflyer.com/en-us/commission",
+};
+
+// Where to check each estimate by hand, including venues whose schedules are not read.
+export const feeScheduleLinks: Partial<Record<Venue, string>> = {
+  ...publicFeeSources,
+  Coinbase: "https://help.coinbase.com/en/coinbase/trading-and-funding/advanced-trade/advanced-trade-fees",
+  Bitstamp: "https://www.bitstamp.net/fee-schedule/",
+  "OKX US": "https://www.okx.com/en-us/fees",
+  "Crypto.com": "https://crypto.com/exchange/document/fees-limits",
 };
 
 export function parsePublishedTaker(venue: Venue, html: string): number | null {
   const page = html.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, " ")
     .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, " ")
-    .replace(/<[^>]+>/g, " ").replace(/&nbsp;|&#160;/gi, " ")
+    .replace(/<[^>]+>/g, " ").replace(/&nbsp;|&#160;/gi, " ").replace(/&ge;/gi, "≥")
     .replace(/\s+/g, " ");
   let matched: RegExpMatchArray | null = null;
-  if (venue === "Coinbase") matched = page.match(/\$0K\s*-\s*\$10K\s+(\d+(?:\.\d+)?)\s*bps/i);
   if (venue === "Kraken") matched = page.match(/Tier 1\s*\|?\s*\$0\+.{0,120}?(\d+(?:\.\d+)?)\s*%\s*\|?\s*(\d+(?:\.\d+)?)\s*%/i);
-  if (venue === "Gemini") matched = page.match(/fees start at.{0,100}?(\d+(?:\.\d+)?)\s*%\s*taker\s*at\s*\$0/i);
+  // Spot rows read maker, taker, 30-day volume, asset balance; the entry row is "≥ $0 ≥ $0".
+  if (venue === "Gemini") matched = page.match(/(\d+(?:\.\d+)?)\s*%\s+(\d+(?:\.\d+)?)\s*%\s+≥\s*\$0\s+≥\s*\$0/);
   if (venue === "CEX.IO") matched = page.match(/Standard maker fees start at.{0,100}?taker fees start at\s*(\d+(?:\.\d+)?)\s*%/i);
   if (venue === "bitFlyer") matched = page.match(/BTC\/USD Trading Fees.{0,200}?\$0\s*-\s*Less than \$50,000\s+(\d+(?:\.\d+)?)\s*%/i);
   if (!matched) return null;
-  const number = Number(venue === "Kraken" ? matched[2] : matched[1]);
-  const rate = venue === "Coinbase" ? number / 100 : number;
+  const rate = Number(venue === "Kraken" || venue === "Gemini" ? matched[2] : matched[1]);
   return Number.isFinite(rate) && rate >= 0 && rate <= 2 ? rate : null;
 }
