@@ -41,6 +41,9 @@ function powershell(script: string, options: { attachConsole?: boolean } = {}) {
 function windowsHelper(): () => void {
   if (process.platform !== "win32") return () => {};
   const script = [
+    // Any failure outside the console tweak ends the helper, so the smoke test's check that it is running
+    // also proves the script compiles.
+    "$ErrorActionPreference = 'Stop'",
     "$sig = @'",
     '[DllImport("kernel32.dll")] public static extern uint SetThreadExecutionState(uint esFlags);',
     '[DllImport("kernel32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr CreateFile(string name, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template);',
@@ -48,9 +51,10 @@ function windowsHelper(): () => void {
     '[DllImport("kernel32.dll")] public static extern bool SetConsoleMode(IntPtr handle, uint mode);',
     "'@",
     "$api = Add-Type -MemberDefinition $sig -Name Win32 -Namespace Arbiter -PassThru",
-    // CONIN$ is this console's input; clear ENABLE_QUICK_EDIT_MODE (0x40), set ENABLE_EXTENDED_FLAGS (0x80).
+    // CONIN$ is this console's input, opened for GENERIC_READ | GENERIC_WRITE (written in decimal: PowerShell reads
+    // 0xC0000000 as a negative Int32). Clear ENABLE_QUICK_EDIT_MODE (0x40), set ENABLE_EXTENDED_FLAGS (0x80).
     "try {",
-    "  $in = $api::CreateFile('CONIN$', 0xC0000000, 3, [IntPtr]::Zero, 3, 0, [IntPtr]::Zero)",
+    "  $in = $api::CreateFile('CONIN$', 3221225472, 3, [IntPtr]::Zero, 3, 0, [IntPtr]::Zero)",
     "  $mode = [uint32]0",
     "  if ($api::GetConsoleMode($in, [ref]$mode)) { $null = $api::SetConsoleMode($in, [uint32](($mode -band 0xFFBF) -bor 0x80)) }",
     "} catch {}",
