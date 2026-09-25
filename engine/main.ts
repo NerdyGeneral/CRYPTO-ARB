@@ -83,8 +83,7 @@ server.on("error", (error: NodeJS.ErrnoException) => {
   throw error;
 });
 
-server.listen(config.port, "127.0.0.1", () => {
-  engine.start();
+server.listen(config.port, "127.0.0.1", async () => {
   const releaseAwake = keepAwake();
   let stopping = false;
   const shutdown = (signal: string) => {
@@ -98,20 +97,21 @@ server.listen(config.port, "127.0.0.1", () => {
   };
   for (const signal of ["SIGINT", "SIGTERM", "SIGHUP", "SIGBREAK"] as const) process.on(signal, () => shutdown(signal));
 
-  const { venues, assets } = config;
+  console.log("\n  ARBITER / LIVE — paper trading engine\n  Simulated trades only. No orders are sent to any exchange.\n\n  Finding markets on each exchange…");
+  openBrowser();
+  await engine.start();
+  const { coins, markets, source, errors } = engine.summary;
   console.log([
-    "",
-    "  ARBITER / LIVE — paper trading engine",
-    "  Simulated trades only. No orders are sent to any exchange.",
     "",
     `  Dashboard:  ${url}`,
     `  Data:       ${store.dir}`,
-    `  Scanning:   ${assets.length} assets across ${venues.length} venues (${venues.join(", ")})`,
+    `  Scanning:   ${coins} coins, ${markets} order books across ${config.venues.length} exchanges (${config.venues.join(", ")})`,
+    `  Routes:     cross-exchange in USD/USDT/USDC${config.triangular ? " + triangles within each exchange" : ""}`,
+    ...(source !== "live" ? [`  Listings:   using ${source === "cache" ? "the last saved listings" : "the built-in coin list"} (${errors.join("; ") || "exchanges unreachable"})`] : []),
     `  Balance:    $${engine.session.balance.toFixed(2)} paper · ${engine.session.tradeCount} trades so far`,
     "",
     "  Keep this window open. Close it (or press Ctrl+C) to stop; progress is saved.",
     "  Settings live in config.json in the data folder; restart after editing it.",
     "",
   ].join("\n"));
-  openBrowser();
 });

@@ -24,14 +24,31 @@ The web page only scans while it is open and visible. `ArbiterPaper.exe` runs th
 2. A console window opens and the dashboard opens in your browser at `http://127.0.0.1:4173`. Keep the console window open; closing it stops the engine (progress is saved).
 3. While it runs, it asks Windows not to sleep. The screen can still turn off. Leave the PC plugged in.
 
+**What it scans.** On start (and every 12 hours) it reads each exchange's public listings and picks the 150 most-traded coins listed on at least two of Coinbase, Kraken, Gemini, Bitstamp, CEX.IO, Binance.US, bitFlyer and OKX US: about 850 order books priced in USD, USDT, USDC and, for triangles, BTC and ETH. CEX.IO is limited to its 80 highest-volume books because its public API allows about 100 requests a minute. If the exchanges can't be reached it uses the last saved listings.
+
+**Routes it evaluates:**
+
+- *Cross-exchange*: buy a coin on one exchange and sell it on another. Either side can be priced in USD, USDT or USDC. Stablecoin legs are valued at that exchange's live stablecoin/USD price, including the cost of converting back to USD (`conversionFee`, default 0.2%, Kraken's entry rate; cheaper where the exchange's own fee is lower).
+- *Triangle*: three trades on one exchange that start and end in USD, for example USD → BTC → ETH → USD or USD → USDT → SOL → USD. No money needs to move between exchanges, but it pays three taker fees.
+
+Every estimate includes each exchange's entry-tier taker fee, conversion costs and the price-movement buffer on every leg, sized to the top of each order book. A paper trade never fills twice against the same unchanged quote, because a real fill would have used that liquidity up.
+
 **Results** are saved in an `arbiter-data` folder next to the exe:
 
-- `trades.csv` — every paper trade
-- `hourly.csv` — one summary row per hour: scans, trades, P&L, best net and suspect gaps
+- `trades.csv` — every paper trade, with its route, size, costs and legs
+- `hourly.csv` — one summary row per hour: trades, P&L, best cross-exchange and triangle net, suspect gaps
 - `session.json` — balance and counters
-- `config.json` — settings: coins, exchanges, budget, minimum profit, fees, buffer, and `maxGap`. Restart after editing.
+- `listings.json` — the last exchange listings
+- `config.json` — settings. Restart after editing:
+  - `topCoins`, `extraCoins`, `excludeCoins` — which coins to scan
+  - `venues` — which exchanges to use
+  - `triangular` — turn triangle routes on or off
+  - `conversionFee` — stablecoin conversion cost
+  - `settings` — budget, minimum profit, per-exchange fees, buffer and `maxGap`
 
 Routes whose raw gap is above `maxGap` (default 2%) are shown as suspect and never traded. Gaps that large almost always mean the two listings cannot be arbitraged, for example because transfers are paused or they are different tokens.
+
+Scanning uses roughly half of one CPU core and 250 MB of memory.
 
 For development, `pnpm engine` bundles and runs the engine with Node without packaging it.
 

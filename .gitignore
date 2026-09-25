@@ -47,6 +47,7 @@ next-env.d.ts
 /work/
 # paper engine build output and local run data
 /dist-engine/
+/dist-tests/
 /release/
 /.cache/
 arbiter-data/

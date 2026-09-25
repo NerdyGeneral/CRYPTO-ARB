@@ -1,194 +1,216 @@
 import { supportedPair, validQuote, type Quote, type SymbolName, type Universe, type Venue } from "./market";
+import { usdMarket, type Market } from "./markets";
 
 type OnQuote = (symbol: SymbolName, venue: Venue, quote: Quote) => void;
 type OnStale = (symbol: SymbolName, venue: Venue) => void;
-type Levels = { bids: Map<number, number>; asks: Map<number, number> };
+type OnMarketQuote = (market: Market, quote: Quote) => void;
+type OnMarketStale = (market: Market) => void;
 
-function asLevels(rows: unknown): Map<number, number> {
-  const levels = new Map<number, number>();
-  if (!Array.isArray(rows)) return levels;
-  for (const row of rows) {
-    if (!Array.isArray(row)) continue;
-    const price = Number(row[0]), size = Number(row[1]);
-    if (Number.isFinite(price) && price > 0 && Number.isFinite(size) && size > 0) levels.set(price, size);
+// A price-level book that keeps its best bid and ask current without rescanning every level;
+// only removing the best level forces a scan.
+class Book {
+  readonly bids = new Map<number, number>();
+  readonly asks = new Map<number, number>();
+  private bestBid = -Infinity;
+  private bestAsk = Infinity;
+
+  static from(bids: unknown, asks: unknown) {
+    const book = new Book();
+    for (const [rows, side] of [[bids, "bid"], [asks, "ask"]] as const) {
+      if (!Array.isArray(rows)) continue;
+      for (const row of rows) if (Array.isArray(row)) book.set(side, Number(row[0]), Number(row[1]));
+    }
+    return book;
   }
-  return levels;
+
+  set(side: "bid" | "ask", price: number, size: number) {
+    if (!Number.isFinite(price) || price <= 0 || !Number.isFinite(size) || size < 0) return;
+    const levels = side === "bid" ? this.bids : this.asks;
+    if (size === 0) {
+      levels.delete(price);
+      if (side === "bid" && price === this.bestBid) { this.bestBid = -Infinity; for (const p of levels.keys()) if (p > this.bestBid) this.bestBid = p; }
+      if (side === "ask" && price === this.bestAsk) { this.bestAsk = Infinity; for (const p of levels.keys()) if (p < this.bestAsk) this.bestAsk = p; }
+      return;
+    }
+    levels.set(price, size);
+    if (side === "bid" && price > this.bestBid) this.bestBid = price;
+    if (side === "ask" && price < this.bestAsk) this.bestAsk = price;
+  }
+
+  quote() {
+    return validQuote(this.bestBid, this.bids.get(this.bestBid), this.bestAsk, this.asks.get(this.bestAsk), "stream");
+  }
 }
 
-function bestOf(levels: Map<number, number>, side: "bid" | "ask"): [number, number] | null {
-  let best = side === "bid" ? -Infinity : Infinity;
-  for (const price of levels.keys()) if (side === "bid" ? price > best : price < best) best = price;
-  return Number.isFinite(best) ? [best, levels.get(best)!] : null;
-}
+const streamUrl: Record<Venue, string | null> = {
+  Coinbase: "wss://ws-feed.exchange.coinbase.com",
+  Kraken: "wss://ws.kraken.com/v2",
+  Gemini: "wss://ws.gemini.com",
+  Bitstamp: "wss://ws.bitstamp.net",
+  "CEX.IO": "wss://trade.cex.io/api/spot/ws-public",
+  "OKX US": "wss://wsus.okx.com:8443/ws/v5/public",
+  "Crypto.com": "wss://stream.crypto.com/exchange/v1/market",
+  "Binance.US": "wss://stream.binance.us:9443/stream",
+  bitFlyer: null, // REST only
+};
 
-// Browser sockets are scoped to the open tab. Reconnects restore Coinbase books from a new snapshot.
-export function connectMarketStreams(universe: Universe, onQuote: OnQuote, onStale?: OnStale): () => void {
+// CEX.IO limits each IP to about 100 requests a minute (subscribes and pings included) and answers
+// "API rate limit reached" then disconnects; Bitstamp takes one subscribe message per book. Both are paced
+// through one queue per venue shared by every socket: CEX.IO at one subscribe a second on a single socket,
+// which with its ping every 8s stays near 70 requests a minute.
+const maxPerSocket: Partial<Record<Venue, number>> = { "CEX.IO": 100, "Binance.US": 1000 };
+const subscribeGapMs: Partial<Record<Venue, number>> = { "CEX.IO": 1000, Bitstamp: 25 };
+const pause = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+const nextSlot = new Map<Venue, number>();
+// Reserves the venue's next send slot and returns how long to wait for it.
+const slotDelay = (venue: Venue) => {
+  const gap = subscribeGapMs[venue] || 0, now = Date.now();
+  const at = Math.max(now, nextSlot.get(venue) || 0);
+  nextSlot.set(venue, at + gap);
+  return at - now;
+};
+
+// Streams best bid/ask for any set of markets. Browser sockets are scoped to the open tab and pause
+// while it is hidden; outside a browser (the background engine) they always run.
+export function connectStreams(markets: Market[], onQuote: OnMarketQuote, onStale?: OnMarketStale): () => void {
   if (typeof WebSocket === "undefined") return () => {};
   let stopped = false;
   const sockets: WebSocket[] = [];
   type Timer = ReturnType<typeof setTimeout>;
   const timers: Timer[] = [];
-  // Outside a browser (the background engine) there is no page visibility, so streams always run.
   const page = typeof document === "undefined" ? undefined : document;
   const isVisible = () => !page?.hidden;
 
-  const connect = (venue: "Coinbase" | "Kraken" | "Gemini" | "Bitstamp" | "CEX.IO" | "OKX US" | "Crypto.com", url: string) => {
+  const connect = (venue: Venue, url: string, list: Market[]) => {
+    const byName = new Map(list.map((market) => [market.ws.toLowerCase(), market]));
+    const find = (name: unknown) => byName.get(String(name ?? "").toLowerCase());
     let socket: WebSocket | null = null;
     let attempts = 0;
     let reconnectTimer: Timer | undefined;
     let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
-    let books = new Map<SymbolName, Levels>();
-    let cexBooks = new Map<SymbolName, Levels & { seqId: number }>();
-    let resyncing = new Set<SymbolName>();
+    let books = new Map<Market, Book>();
+    let cexBooks = new Map<Market, { book: Book; seqId: number }>();
+    let resyncing = new Set<Market>();
+    const cexSubscribe = (market: Market) => JSON.stringify({ e: "order_book_subscribe", oid: `${market.ws}-${Date.now()}`, data: { pair: market.ws } });
     const start = () => {
-      const assets = universe.assets.filter((asset) => supportedPair(asset, venue));
-      if (stopped || !isVisible() || !universe.venues.includes(venue) || !assets.length) return;
+      if (stopped || !isVisible()) return;
       books = new Map();
       cexBooks = new Map();
       resyncing = new Set();
       try { socket = new WebSocket(url); } catch { schedule(); return; }
       const ws = socket;
       sockets.push(ws);
+      // Sends one message per book in the venue's shared send slots, until the socket closes.
+      const paced = async (messages: string[]) => {
+        for (const message of messages) {
+          const delay = slotDelay(venue);
+          if (delay) await pause(delay);
+          if (socket !== ws || ws.readyState !== WebSocket.OPEN) return;
+          ws.send(message);
+        }
+      };
       ws.onopen = () => {
         attempts = 0;
+        const names = list.map((market) => market.ws);
         if (venue === "Coinbase") {
-          ws.send(JSON.stringify({ type: "subscribe", product_ids: assets.map((asset) => `${asset}-USD`), channels: ["level2_batch"] }));
+          ws.send(JSON.stringify({ type: "subscribe", product_ids: names, channels: ["level2_batch"] }));
         } else if (venue === "Kraken") {
-          ws.send(JSON.stringify({ method: "subscribe", params: { channel: "ticker", symbol: assets.map((asset) => `${asset}/USD`), event_trigger: "bbo", snapshot: true } }));
+          ws.send(JSON.stringify({ method: "subscribe", params: { channel: "ticker", symbol: names, event_trigger: "bbo", snapshot: true } }));
         } else if (venue === "Gemini") {
-          ws.send(JSON.stringify({ id: String(Date.now()), method: "subscribe", params: assets.map((asset) => `${asset.toLowerCase()}usd@bookTicker`) }));
+          ws.send(JSON.stringify({ id: String(Date.now()), method: "subscribe", params: names.map((name) => `${name}@bookTicker`) }));
         } else if (venue === "Bitstamp") {
-          for (const asset of assets) ws.send(JSON.stringify({ event: "bts:subscribe", data: { channel: `order_book_${asset.toLowerCase()}usd` } }));
+          void paced(names.map((name) => JSON.stringify({ event: "bts:subscribe", data: { channel: `order_book_${name}` } })));
         } else if (venue === "CEX.IO") {
-          for (const asset of assets) ws.send(JSON.stringify({ e: "order_book_subscribe", oid: `${asset}-${Date.now()}`, data: { pair: `${asset}-USD` } }));
+          void paced(list.map(cexSubscribe));
           heartbeatTimer = setInterval(() => { if (socket === ws) ws.send(JSON.stringify({ e: "ping" })); }, 8000);
         } else if (venue === "OKX US") {
-          ws.send(JSON.stringify({ id: String(Date.now()), op: "subscribe", args: assets.map((asset) => ({ channel: "bbo-tbt", instId: `${asset}-USD` })) }));
+          ws.send(JSON.stringify({ id: String(Date.now()), op: "subscribe", args: names.map((instId) => ({ channel: "bbo-tbt", instId })) }));
+        } else if (venue === "Binance.US") {
+          for (let i = 0; i < names.length; i += 200)
+            ws.send(JSON.stringify({ method: "SUBSCRIBE", params: names.slice(i, i + 200).map((name) => `${name}@bookTicker`), id: i + 1 }));
         } else {
-          ws.send(JSON.stringify({ id: Date.now(), method: "subscribe", nonce: Date.now(), params: { channels: assets.map((asset) => `ticker.${asset}_USD`) } }));
+          ws.send(JSON.stringify({ id: Date.now(), method: "subscribe", nonce: Date.now(), params: { channels: names.map((name) => `ticker.${name}`) } }));
         }
       };
       ws.onmessage = (event) => {
         try {
           if (event.data === "ping") { ws.send("pong"); return; }
           const message = JSON.parse(String(event.data)) as Record<string, unknown>;
+          const emit = (market: Market | undefined, quote: Quote | null) => { if (market && quote) onQuote(market, quote); };
           if (venue === "Gemini") {
-            const symbol = String(message.s || "").replace(/usd$/i, "").toUpperCase() as SymbolName;
-            if (!universe.assets.includes(symbol)) return;
-            const quote = validQuote(message.b, message.B, message.a, message.A, "stream");
-            if (quote) onQuote(symbol, "Gemini", quote);
-            return;
-          }
-          if (venue === "Bitstamp") {
+            emit(find(message.s), validQuote(message.b, message.B, message.a, message.A, "stream"));
+          } else if (venue === "Binance.US") {
+            const data = message.data as Record<string, unknown> | undefined;
+            if (data) emit(find(data.s), validQuote(data.b, data.B, data.a, data.A, "stream"));
+          } else if (venue === "Bitstamp") {
             if (message.event === "bts:request_reconnect") { ws.close(); return; }
             if (message.event !== "data") return;
-            const symbol = String(message.channel || "").replace(/^order_book_/, "").replace(/usd$/i, "").toUpperCase() as SymbolName;
-            if (!universe.assets.includes(symbol)) return;
             const depth = message.data as { bids?: unknown[][]; asks?: unknown[][] } | undefined;
-            const quote = validQuote(depth?.bids?.[0]?.[0], depth?.bids?.[0]?.[1], depth?.asks?.[0]?.[0], depth?.asks?.[0]?.[1], "stream");
-            if (quote) onQuote(symbol, "Bitstamp", quote);
-            return;
-          }
-          if (venue === "CEX.IO") {
+            emit(find(String(message.channel || "").replace(/^order_book_/, "")),
+              validQuote(depth?.bids?.[0]?.[0], depth?.bids?.[0]?.[1], depth?.asks?.[0]?.[0], depth?.asks?.[0]?.[1], "stream"));
+          } else if (venue === "CEX.IO") {
             if (message.e === "disconnected") { ws.close(); return; }
             if (message.ok !== "ok" || (message.e !== "order_book_subscribe" && message.e !== "order_book_increment")) return;
             const data = message.data as { pair?: string; seqId?: number; bids?: unknown[][]; asks?: unknown[][] } | undefined;
-            const symbol = String(data?.pair || "").split("-")[0] as SymbolName;
-            if (!universe.assets.includes(symbol) || !supportedPair(symbol, venue)) return;
+            const market = find(data?.pair);
+            if (!market) return;
             if (message.e === "order_book_subscribe") {
               if (!Number.isSafeInteger(data?.seqId)) return;
-              cexBooks.set(symbol, { bids: asLevels(data?.bids), asks: asLevels(data?.asks), seqId: data!.seqId! });
-              resyncing.delete(symbol);
+              cexBooks.set(market, { book: Book.from(data?.bids, data?.asks), seqId: data!.seqId! });
+              resyncing.delete(market);
             } else {
-              const book = cexBooks.get(symbol);
-              if (!book || data?.seqId !== book.seqId + 1) {
-                cexBooks.delete(symbol);
-                onStale?.(symbol, venue);
-                if (!resyncing.has(symbol)) {
-                  resyncing.add(symbol);
-                  ws.send(JSON.stringify({ e: "order_book_subscribe", oid: `${symbol}-${Date.now()}`, data: { pair: `${symbol}-USD` } }));
-                }
+              const entry = cexBooks.get(market);
+              if (!entry || data?.seqId !== entry.seqId + 1) {
+                cexBooks.delete(market);
+                onStale?.(market);
+                if (!resyncing.has(market)) { resyncing.add(market); void paced([cexSubscribe(market)]); }
                 return;
               }
-              book.seqId = data!.seqId!;
-              for (const [rows, levels] of [[data?.bids, book.bids], [data?.asks, book.asks]] as [unknown[][] | undefined, Map<number, number>][]) {
-                for (const row of rows || []) {
-                  if (!Array.isArray(row)) continue;
-                  const px = Number(row[0]), size = Number(row[1]);
-                  if (!Number.isFinite(px) || px <= 0 || !Number.isFinite(size) || size < 0) continue;
-                  if (size === 0) levels.delete(px); else levels.set(px, size);
-                }
-              }
+              entry.seqId = data!.seqId!;
+              for (const row of data?.bids || []) if (Array.isArray(row)) entry.book.set("bid", Number(row[0]), Number(row[1]));
+              for (const row of data?.asks || []) if (Array.isArray(row)) entry.book.set("ask", Number(row[0]), Number(row[1]));
             }
-            const book = cexBooks.get(symbol);
-            if (!book) return;
-            const bid = bestOf(book.bids, "bid"), ask = bestOf(book.asks, "ask");
-            const quote = validQuote(bid?.[0], bid?.[1], ask?.[0], ask?.[1], "stream");
-            if (quote) onQuote(symbol, "CEX.IO", quote);
-            return;
-          }
-          if (venue === "OKX US") {
+            emit(market, cexBooks.get(market)?.book.quote() ?? null);
+          } else if (venue === "OKX US") {
             const arg = message.arg as { channel?: string; instId?: string } | undefined;
             if (arg?.channel !== "bbo-tbt" || !Array.isArray(message.data)) return;
-            const symbol = String(arg.instId || "").split("-")[0] as SymbolName;
-            if (!universe.assets.includes(symbol)) return;
             const depth = (message.data as { bids?: unknown[][]; asks?: unknown[][] }[])[0];
-            const quote = validQuote(depth?.bids?.[0]?.[0], depth?.bids?.[0]?.[1], depth?.asks?.[0]?.[0], depth?.asks?.[0]?.[1], "stream");
-            if (quote) onQuote(symbol, "OKX US", quote);
-            return;
-          }
-          if (venue === "Crypto.com") {
-            if (message.method === "public/heartbeat") {
-              ws.send(JSON.stringify({ id: message.id, method: "public/respond-heartbeat" }));
-              return;
-            }
+            emit(find(arg.instId), validQuote(depth?.bids?.[0]?.[0], depth?.bids?.[0]?.[1], depth?.asks?.[0]?.[0], depth?.asks?.[0]?.[1], "stream"));
+          } else if (venue === "Crypto.com") {
+            if (message.method === "public/heartbeat") { ws.send(JSON.stringify({ id: message.id, method: "public/respond-heartbeat" })); return; }
             const result = message.result as { channel?: string; instrument_name?: string; data?: Record<string, unknown>[] } | undefined;
             if (result?.channel !== "ticker" || !Array.isArray(result.data)) return;
-            for (const tick of result.data) {
-              const symbol = String(tick.i || result.instrument_name || "").split("_")[0] as SymbolName;
-              if (!universe.assets.includes(symbol)) continue;
-              const quote = validQuote(tick.b, tick.bs, tick.k, tick.ks, "stream");
-              if (quote) onQuote(symbol, "Crypto.com", quote);
-            }
-            return;
-          }
-          if (venue === "Kraken") {
+            for (const tick of result.data) emit(find(tick.i || result.instrument_name), validQuote(tick.b, tick.bs, tick.k, tick.ks, "stream"));
+          } else if (venue === "Kraken") {
             if (message.channel !== "ticker" || !Array.isArray(message.data)) return;
-            for (const ticker of message.data as Record<string, unknown>[]) {
-              const symbol = String(ticker.symbol || "").split("/")[0] as SymbolName;
-              if (!universe.assets.includes(symbol)) continue;
-              const quote = validQuote(ticker.bid, ticker.bid_qty, ticker.ask, ticker.ask_qty, "stream");
-              if (quote) onQuote(symbol, "Kraken", quote);
-            }
-            return;
+            for (const ticker of message.data as Record<string, unknown>[]) emit(find(ticker.symbol), validQuote(ticker.bid, ticker.bid_qty, ticker.ask, ticker.ask_qty, "stream"));
+          } else {
+            const market = find(message.product_id);
+            if (!market) return;
+            if (message.type === "snapshot") {
+              books.set(market, Book.from(message.bids, message.asks));
+            } else if (message.type === "l2update") {
+              const book = books.get(market);
+              if (!book || !Array.isArray(message.changes)) return;
+              for (const change of message.changes as unknown[][]) {
+                if (Array.isArray(change) && (change[0] === "buy" || change[0] === "sell")) book.set(change[0] === "buy" ? "bid" : "ask", Number(change[1]), Number(change[2]));
+              }
+            } else return;
+            emit(market, books.get(market)?.quote() ?? null);
           }
-          const symbol = String(message.product_id || "").split("-")[0] as SymbolName;
-          if (!universe.assets.includes(symbol)) return;
-          if (message.type === "snapshot") {
-            books.set(symbol, { bids: asLevels(message.bids), asks: asLevels(message.asks) });
-          } else if (message.type === "l2update") {
-            const book = books.get(symbol);
-            if (!book || !Array.isArray(message.changes)) return;
-            for (const change of message.changes as unknown[][]) {
-              if (!Array.isArray(change)) continue;
-              const levels = change[0] === "buy" ? book.bids : change[0] === "sell" ? book.asks : null;
-              if (!levels) continue;
-              const price = Number(change[1]), size = Number(change[2]);
-              if (!Number.isFinite(price) || price <= 0 || !Number.isFinite(size) || size < 0) continue;
-              if (size === 0) levels.delete(price); else levels.set(price, size);
-            }
-          } else return;
-          const book = books.get(symbol);
-          if (!book) return;
-          const bid = bestOf(book.bids, "bid"), ask = bestOf(book.asks, "ask");
-          const quote = validQuote(bid?.[0], bid?.[1], ask?.[0], ask?.[1], "stream");
-          if (quote) onQuote(symbol, "Coinbase", quote);
         } catch { /* Ignore malformed exchange messages; the REST fallback remains available. */ }
       };
       // Node's WebSocket fires error again from inside close() on a failed connection; close once.
       let closing = false;
       ws.onerror = () => { if (closing) return; closing = true; ws.close(); };
-      ws.onclose = () => { if (socket === ws) { socket = null; books.clear(); cexBooks.clear(); for (const asset of assets) onStale?.(asset, venue); if (heartbeatTimer) clearInterval(heartbeatTimer); heartbeatTimer = undefined; schedule(); } };
+      ws.onclose = () => {
+        if (socket !== ws) return;
+        socket = null; books.clear(); cexBooks.clear();
+        for (const market of list) onStale?.(market);
+        if (heartbeatTimer) clearInterval(heartbeatTimer);
+        heartbeatTimer = undefined;
+        schedule();
+      };
     };
     const schedule = () => {
       if (stopped || !isVisible()) return;
@@ -206,18 +228,26 @@ export function connectMarketStreams(universe: Universe, onQuote: OnQuote, onSta
     return () => page?.removeEventListener("visibilitychange", visibility);
   };
 
+  const byVenue = new Map<Venue, Market[]>();
+  for (const market of markets) byVenue.set(market.venue, [...(byVenue.get(market.venue) || []), market]);
   const cleanups: (() => void)[] = [];
-  if (universe.venues.includes("Coinbase")) cleanups.push(connect("Coinbase", "wss://ws-feed.exchange.coinbase.com"));
-  if (universe.venues.includes("Kraken")) cleanups.push(connect("Kraken", "wss://ws.kraken.com/v2"));
-  if (universe.venues.includes("Gemini")) cleanups.push(connect("Gemini", "wss://ws.gemini.com"));
-  if (universe.venues.includes("Bitstamp")) cleanups.push(connect("Bitstamp", "wss://ws.bitstamp.net"));
-  if (universe.venues.includes("CEX.IO")) cleanups.push(connect("CEX.IO", "wss://trade.cex.io/api/spot/ws-public"));
-  if (universe.venues.includes("OKX US")) cleanups.push(connect("OKX US", "wss://wsus.okx.com:8443/ws/v5/public"));
-  if (universe.venues.includes("Crypto.com")) cleanups.push(connect("Crypto.com", "wss://stream.crypto.com/exchange/v1/market"));
+  for (const [venue, list] of byVenue) {
+    const url = streamUrl[venue];
+    const size = maxPerSocket[venue] || list.length;
+    if (url) for (let i = 0; i < list.length; i += size) cleanups.push(connect(venue, url, list.slice(i, i + size)));
+  }
   return () => {
     stopped = true;
     cleanups.forEach((cleanup) => cleanup());
     timers.forEach((timer) => clearTimeout(timer));
     sockets.forEach((socket) => socket.close());
   };
+}
+
+// The dashboard's USD universe, expressed as markets.
+export function connectMarketStreams(universe: Universe, onQuote: OnQuote, onStale?: OnStale): () => void {
+  const markets = universe.venues.flatMap((venue) => universe.assets.filter((asset) => supportedPair(asset, venue)).map((asset) => usdMarket(asset, venue)));
+  return connectStreams(markets,
+    (market, quote) => onQuote(market.base as SymbolName, market.venue, quote),
+    (market) => onStale?.(market.base as SymbolName, market.venue));
 }

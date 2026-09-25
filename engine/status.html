@@ -40,12 +40,16 @@
   th { color: var(--muted); font: 11px var(--mono); letter-spacing: .06em; text-transform: uppercase; }
   td.num, th.num { text-align: right; font-family: var(--mono); }
   .pos { color: var(--pos); } .neg { color: var(--neg); } .muted { color: var(--muted); } .warn { color: var(--warn); }
-  .empty { padding: 16px; color: var(--muted); }
+  .empty { padding: 16px; color: var(--muted); white-space: normal; }
   .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
   .grid2 section { margin-top: 16px; min-width: 0; }
   @media (max-width: 860px) { .grid2 { grid-template-columns: 1fr; } }
   footer { color: var(--muted); font-size: 12px; margin-top: 20px; overflow-wrap: anywhere; }
   code { font-family: var(--mono); color: var(--text); }
+  .tag { display: inline-block; font: 10px var(--mono); letter-spacing: .06em; text-transform: uppercase; padding: 1px 6px; border-radius: 4px; border: 1px solid var(--line); color: var(--muted); margin-right: 6px; }
+  .tag.triangle { color: var(--accent); border-color: #5e4630; }
+  .coverage { display: flex; flex-wrap: wrap; gap: 6px 18px; margin: 14px 0 0; color: var(--muted); font-size: 12px; }
+  .coverage strong { color: var(--text); font-weight: 600; }
 </style>
 </head>
 <body>
@@ -58,44 +62,46 @@
       <button id="reset" class="ghost" disabled>Reset session</button>
     </div>
   </header>
-  <p class="note">Simulated trades only. Nothing is sent to an exchange. Results assume pre-funded balances on both exchanges, fills at the quoted size, and no transfer or withdrawal costs.</p>
+  <p class="note">Simulated trades only. Nothing is sent to an exchange. Results assume pre-funded balances on every exchange used, fills at the quoted size, and no transfer or withdrawal costs.</p>
+  <p class="coverage" id="coverage">Finding markets on each exchange…</p>
 
   <div class="stats">
     <div class="stat"><small>Paper balance</small><strong id="balance">—</strong><span id="start">&nbsp;</span></div>
-    <div class="stat"><small>Paper P&amp;L</small><strong id="pnl">—</strong><span>after fees + buffer</span></div>
+    <div class="stat"><small>Paper P&amp;L</small><strong id="pnl">—</strong><span>after fees, conversion + buffer</span></div>
     <div class="stat"><small>Simulated trades</small><strong id="trades">—</strong><span id="scans">&nbsp;</span></div>
-    <div class="stat"><small>Best net this hour</small><strong id="bestNet">—</strong><span>tradable routes only</span></div>
+    <div class="stat"><small>Best cross-exchange</small><strong id="bestCross">—</strong><span>net, this hour</span></div>
+    <div class="stat"><small>Best triangle</small><strong id="bestTri">—</strong><span>net, this hour</span></div>
     <div class="stat"><small>Running for</small><strong id="uptime">—</strong><span id="since">&nbsp;</span></div>
   </div>
 
   <section>
     <h2>Exchange feeds</h2>
-    <p class="sub">Live = pairs with a quote under 12 seconds old. Streaming feeds update instantly; others are polled.</p>
-    <div class="scroll"><table><thead><tr><th>Exchange</th><th class="num">Live pairs</th><th>Source</th><th class="num">Last quote</th><th class="num">Poll errors</th></tr></thead><tbody id="feeds"></tbody></table></div>
+    <p class="sub">Live = order books with a quote under 12 seconds old. Streaming feeds update instantly; others are polled.</p>
+    <div class="scroll"><table><thead><tr><th>Exchange</th><th class="num">Live books</th><th>Source</th><th class="num">Last quote</th><th class="num">Poll errors</th></tr></thead><tbody id="feeds"></tbody></table></div>
   </section>
 
   <section>
     <h2>Current best routes</h2>
-    <p class="sub">Buy on the first exchange, sell on the second. Net includes both taker fees and the price buffer.</p>
-    <div class="scroll"><table><thead><tr><th>Pair</th><th>Route</th><th class="num">Buy ask</th><th class="num">Sell bid</th><th class="num">Raw gap</th><th class="num">Est. net</th></tr></thead><tbody id="routes"></tbody></table></div>
+    <p class="sub">Cross: buy on the first exchange, sell on the second; stablecoin legs are converted at the live rate. Triangle: three trades on one exchange starting and ending in USD. Net includes every taker fee, conversion cost and the price buffer.</p>
+    <div class="scroll"><table><thead><tr><th>Route</th><th class="num">Size</th><th class="num">Raw gap</th><th class="num">Fees</th><th class="num">Est. net</th></tr></thead><tbody id="routes"></tbody></table></div>
   </section>
 
   <section>
     <h2>Suspect gaps (not traded)</h2>
     <p class="sub" id="suspectNote">Raw gaps above the max believable gap. These usually mean transfers are paused or the two listings are not the same token.</p>
-    <div class="scroll"><table><thead><tr><th>Pair</th><th>Route</th><th class="num">Raw gap</th><th class="num">Would-be net</th></tr></thead><tbody id="suspects"></tbody></table></div>
+    <div class="scroll"><table><thead><tr><th>Route</th><th class="num">Raw gap</th><th class="num">Would-be net</th></tr></thead><tbody id="suspects"></tbody></table></div>
   </section>
 
   <div class="grid2">
     <section>
       <h2>Hourly summary</h2>
       <p class="sub">One row per hour, saved to <code>hourly.csv</code>.</p>
-      <div class="scroll"><table><thead><tr><th>Hour</th><th class="num">Trades</th><th class="num">P&amp;L</th><th class="num">Best net</th><th class="num">Suspect</th></tr></thead><tbody id="hours"></tbody></table></div>
+      <div class="scroll"><table><thead><tr><th>Hour</th><th class="num">Trades</th><th class="num">P&amp;L</th><th class="num">Best cross</th><th class="num">Best triangle</th><th class="num">Suspect</th></tr></thead><tbody id="hours"></tbody></table></div>
     </section>
     <section>
       <h2>Paper trade log</h2>
       <p class="sub">Latest 50, full log in <code>trades.csv</code>.</p>
-      <div class="scroll"><table><thead><tr><th>Time</th><th>Pair</th><th>Route</th><th class="num">Net</th></tr></thead><tbody id="log"></tbody></table></div>
+      <div class="scroll"><table><thead><tr><th>Time</th><th>Route</th><th class="num">Net</th></tr></thead><tbody id="log"></tbody></table></div>
     </section>
   </div>
 
@@ -107,11 +113,12 @@
   const money = (n, d = 2) => (n < 0 ? "−" : "") + "$" + Math.abs(n).toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d });
   const signed = (n) => (n >= 0 ? "+" : "−") + money(Math.abs(n), Math.abs(n) < 1 && n !== 0 ? 3 : 2);
   const pct = (n) => n === null || n === undefined || n === "" || Number.isNaN(Number(n)) ? "—" : (Number(n) >= 0 ? "+" : "−") + Math.abs(Number(n)).toFixed(2) + "%";
-  const price = (n) => money(n, n < 0.001 ? 10 : n < 1 ? 6 : n < 10 ? 4 : 2);
-  const cls = (n) => n > 0 ? "pos" : n < 0 ? "neg" : "muted";
+  const num = (v) => v === "" || v === undefined || v === null ? null : Number(v);
+  const cls = (n) => n === null ? "muted" : n > 0 ? "pos" : n < 0 ? "neg" : "muted";
   const ago = (ms) => ms === null ? "never" : ms < 1500 ? "now" : ms < 90000 ? Math.round(ms / 1000) + "s ago" : Math.round(ms / 60000) + "m ago";
   const duration = (ms) => { const m = Math.floor(ms / 60000), h = Math.floor(m / 60), d = Math.floor(h / 24); return d ? `${d}d ${h % 24}h` : h ? `${h}h ${m % 60}m` : `${m}m`; };
   const rows = (id, list, render, cols, empty) => { $(id).innerHTML = list.length ? list.map(render).join("") : `<tr><td colspan="${cols}" class="empty">${empty}</td></tr>`; };
+  const route = (r) => `<span class="tag ${r.kind}">${r.kind === "triangle" ? "Triangle" : "Cross"}</span>${esc(r.path)}`;
   let running = null;
 
   async function refresh() {
@@ -119,44 +126,47 @@
     try { const r = await fetch("/api/state", { cache: "no-store" }); if (!r.ok) throw new Error(); s = await r.json(); }
     catch { $("state").className = "pill offline"; $("state").textContent = "ENGINE STOPPED"; $("toggle").disabled = $("reset").disabled = true; return; }
     running = s.running;
-    $("state").className = "pill " + (s.running ? "running" : "paused");
-    $("state").textContent = s.running ? "RUNNING" : "PAUSED";
-    $("toggle").disabled = $("reset").disabled = false;
+    $("state").className = "pill " + (!s.ready ? "paused" : s.running ? "running" : "paused");
+    $("state").textContent = !s.ready ? "STARTING" : s.running ? "RUNNING" : "PAUSED";
+    $("toggle").disabled = $("reset").disabled = !s.ready;
     $("toggle").textContent = s.running ? "Pause" : "Resume";
+    const cov = s.coverage, rate = (c) => s.rates[c] ? `${c} $${s.rates[c].mid.toFixed(4)}` : `${c} —`;
+    $("coverage").innerHTML = !s.ready ? "Finding markets on each exchange…" :
+      `<span><strong>${cov.coins}</strong> coins</span><span><strong>${cov.markets.toLocaleString()}</strong> order books</span>` +
+      `<span><strong>${s.feeds.length}</strong> exchanges</span><span>${rate("USDT")} · ${rate("USDC")}</span>` +
+      `<span>Top: ${esc(cov.topCoins.join(" "))}…</span>` + (cov.source !== "live" ? `<span class="warn">Using ${cov.source === "cache" ? "saved" : "built-in"} listings</span>` : "");
     const ses = s.session;
     $("balance").textContent = money(ses.balance);
     $("start").textContent = "Started at " + money(ses.startingBalance);
     $("pnl").textContent = signed(ses.pnl); $("pnl").className = cls(ses.pnl);
     $("trades").textContent = ses.tradeCount.toLocaleString();
     $("scans").textContent = ses.scans.toLocaleString() + " scans";
-    const best = s.currentHour.bestNetPct;
-    $("bestNet").textContent = pct(best); $("bestNet").className = best === null ? "" : cls(best);
+    for (const [id, v] of [["bestCross", s.currentHour.bestNetPct], ["bestTri", s.triangular ? s.currentHour.bestTriangleNetPct : null]]) { $(id).textContent = pct(v); $(id).className = cls(v); }
     $("uptime").textContent = duration(s.now - s.startedAt);
     $("since").textContent = "session since " + new Date(ses.startedAt).toLocaleDateString();
 
-    rows("feeds", s.feeds, (f) => `<tr><td>${esc(f.venue)}</td><td class="num ${f.live === f.pairs ? "pos" : f.live ? "warn" : "neg"}">${f.live}/${f.pairs}</td>` +
+    rows("feeds", s.feeds, (f) => `<tr><td>${esc(f.venue)}${f.indicative ? ' <span class="muted">(indicative)</span>' : ""}</td><td class="num ${f.live >= f.markets * 0.9 ? "pos" : f.live ? "warn" : "neg"}">${f.live}/${f.markets}</td>` +
       `<td>${f.streaming ? '<span class="pos">Streaming</span>' : f.restQuotes ? '<span class="warn">Polling</span>' : '<span class="neg">No data</span>'}</td>` +
-      `<td class="num muted">${ago(f.lastQuoteAgoMs)}</td><td class="num muted">${f.restErrors}</td></tr>`, 5, "No exchanges selected.");
+      `<td class="num muted">${ago(f.lastQuoteAgoMs)}</td><td class="num muted">${f.restErrors}</td></tr>`, 5, s.ready ? "No exchanges selected." : "Starting…");
 
-    const tradable = s.routes.filter((r) => !r.suspect);
-    rows("routes", tradable, (r) => `<tr><td><strong>${esc(r.symbol)}</strong></td><td>${esc(r.buy)} → ${esc(r.sell)}</td><td class="num">${price(r.ask)}</td><td class="num">${price(r.bid)}</td>` +
-      `<td class="num ${r.grossPct > 0 ? "pos" : "muted"}">${pct(r.grossPct)}</td><td class="num ${cls(r.net)}">${signed(r.net)} <span class="muted">${pct(r.netPct)}</span></td></tr>`, 6,
-      "Waiting for quotes from at least two exchanges…");
+    rows("routes", s.routes, (r) => `<tr><td>${route(r)}</td><td class="num">${money(r.notional)}</td><td class="num ${r.grossPct > 0 ? "pos" : "muted"}">${pct(r.grossPct)}</td>` +
+      `<td class="num muted">${money(r.fees + r.conversion, 3)}</td><td class="num ${cls(r.net)}">${signed(r.net)} <span class="muted">${pct(r.netPct)}</span></td></tr>`, 5,
+      s.ready ? "Waiting for fresh quotes…" : "Finding markets…");
 
-    rows("suspects", s.suspectRoutes, (r) => `<tr><td><strong>${esc(r.symbol)}</strong></td><td>${esc(r.buy)} → ${esc(r.sell)}</td><td class="num warn">${pct(r.grossPct)}</td><td class="num muted">${signed(r.net)}</td></tr>`, 4,
-      "None right now.");
+    rows("suspects", s.suspectRoutes, (r) => `<tr><td>${route(r)}</td><td class="num warn">${pct(r.grossPct)}</td><td class="num muted">${signed(r.net)}</td></tr>`, 3, "None right now.");
     $("suspectNote").textContent = `Raw gaps above ${s.settings.maxGap}% (maxGap in config.json). These usually mean transfers are paused or the two listings are not the same token, so they are never paper-traded.`;
 
-    const current = { ...s.currentHour, current: true };
-    const hours = [current, ...s.hours.map((h) => ({ hour: h.hour, trades: Number(h.trades), pnl: Number(h.pnl_usd), bestNetPct: h.best_net_pct === "" ? null : Number(h.best_net_pct), suspectRoutes: Number(h.suspect_routes) }))];
+    const hours = [{ ...s.currentHour, current: true }, ...s.hours.map((h) => ({ hour: h.hour, trades: Number(h.trades), pnl: Number(h.pnl_usd),
+      bestNetPct: num(h.best_net_pct), bestTriangleNetPct: num(h.best_triangle_net_pct), suspectRoutes: Number(h.suspect_routes) }))];
     rows("hours", hours, (h) => `<tr><td>${new Date(h.hour).toLocaleString([], { month: "short", day: "numeric", hour: "numeric" })}${h.current ? ' <span class="muted">(now)</span>' : ""}</td>` +
-      `<td class="num">${h.trades}</td><td class="num ${cls(h.pnl)}">${signed(h.pnl)}</td><td class="num ${h.bestNetPct === null ? "muted" : cls(h.bestNetPct)}">${pct(h.bestNetPct)}</td><td class="num ${h.suspectRoutes ? "warn" : "muted"}">${h.suspectRoutes}</td></tr>`, 5, "");
+      `<td class="num">${h.trades}</td><td class="num ${cls(h.pnl)}">${signed(h.pnl)}</td><td class="num ${cls(h.bestNetPct)}">${pct(h.bestNetPct)}</td>` +
+      `<td class="num ${cls(h.bestTriangleNetPct)}">${pct(h.bestTriangleNetPct)}</td><td class="num ${h.suspectRoutes ? "warn" : "muted"}">${h.suspectRoutes}</td></tr>`, 6, "");
 
     rows("log", s.trades, (t) => `<tr><td class="muted">${new Date(t.time).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit", second: "2-digit" })}</td>` +
-      `<td><strong>${esc(t.symbol)}</strong></td><td>${esc(t.buy)} → ${esc(t.sell)}</td><td class="num ${cls(t.net)}">${signed(t.net)}</td></tr>`, 4,
-      "No paper trades yet. A trade is logged only when a route's estimated net clears your minimum after fees.");
+      `<td>${route(t)}</td><td class="num ${cls(t.net)}">${signed(t.net)}</td></tr>`, 3,
+      "No paper trades yet. A trade is logged only when a route's estimated net clears your minimum after all costs.");
 
-    $("footer").innerHTML = `Data folder: <code>${esc(s.dataDir)}</code> · Budget ${money(s.settings.budget)} per trade · minimum net ${money(s.settings.minNet)} · buffer ${s.settings.buffer}% per side`;
+    $("footer").innerHTML = `Data folder: <code>${esc(s.dataDir)}</code> · Budget ${money(s.settings.budget)} per trade · minimum net ${money(s.settings.minNet)} · buffer ${s.settings.buffer}% per leg · stablecoin conversion ${s.conversionFee}%`;
   }
 
   async function post(path, body) {
