@@ -143,5 +143,8 @@ export function selectMarkets(listing: Listing, options: {
     seen.add(key);
     return true;
   });
+  // Most-traded first, so venues that subscribe slowly (CEX.IO) bring the important books up first.
+  const rank = (m: Market) => isDollarStable(m.base) ? -1 : coins.indexOf(m.base);
+  markets.sort((a, b) => rank(a) - rank(b));
   return { coins, markets };
 }

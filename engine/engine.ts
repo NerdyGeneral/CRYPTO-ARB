@@ -20,7 +20,7 @@ const INDICATIVE: Venue[] = ["Crypto.com"];
 
 // Per-market REST budget per venue in requests per second, well under each exchange's public limit.
 const restRate: Record<Venue, number> = {
-  Coinbase: 4, Kraken: 1, Gemini: 1.5, Bitstamp: 4, "CEX.IO": 1, bitFlyer: 1, "OKX US": 4, "Crypto.com": 4, "Binance.US": 4,
+  Coinbase: 4, Kraken: 1, Gemini: 1.5, Bitstamp: 4, "CEX.IO": 0.5, bitFlyer: 1, "OKX US": 4, "Crypto.com": 4, "Binance.US": 4,
 };
 
 type VenueStats = { streamQuotes: number; restQuotes: number; restErrors: number; lastStreamAt: number; lastQuoteAt: number };

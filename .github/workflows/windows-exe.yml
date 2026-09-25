@@ -41,7 +41,8 @@ jobs:
           $env:ARBITER_DATA_DIR = Join-Path $env:RUNNER_TEMP "arbiter-data"
           $proc = Start-Process -FilePath release\ArbiterPaper.exe -PassThru -NoNewWindow `
             -RedirectStandardOutput engine-out.txt -RedirectStandardError engine-err.txt
-          Start-Sleep -Seconds 75
+          # CEX.IO allows only a few subscriptions a second, so its ~300 books take about 75s to come up.
+          Start-Sleep -Seconds 120
           try { $state = Invoke-RestMethod http://127.0.0.1:4173/api/state }
           finally { Get-Content engine-out.txt, engine-err.txt | Write-Host }
           $state.feeds | Format-Table venue, live, markets, streaming, streamQuotes, restQuotes, restErrors | Out-String | Write-Host

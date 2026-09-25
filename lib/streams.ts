@@ -54,11 +54,20 @@ const streamUrl: Record<Venue, string | null> = {
   bitFlyer: null, // REST only
 };
 
-// CEX.IO drops a connection that subscribes to too many books too quickly (about 140 per socket, or
-// ~100 at once), and Bitstamp takes one subscribe message per book, so those are split and paced.
+// CEX.IO answers "API rate limit reached" and disconnects when one IP subscribes faster than a few books a
+// second, across all of its sockets; Bitstamp takes one subscribe message per book. Both are paced through a
+// single queue per venue, shared by every socket, and CEX.IO books are spread over sockets of 60.
 const maxPerSocket: Partial<Record<Venue, number>> = { "CEX.IO": 60, "Binance.US": 1000 };
-const subscribeGapMs: Partial<Record<Venue, number>> = { "CEX.IO": 100, Bitstamp: 25 };
+const subscribeGapMs: Partial<Record<Venue, number>> = { "CEX.IO": 250, Bitstamp: 25 };
 const pause = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+const nextSlot = new Map<Venue, number>();
+// Reserves the venue's next send slot and returns how long to wait for it.
+const slotDelay = (venue: Venue) => {
+  const gap = subscribeGapMs[venue] || 0, now = Date.now();
+  const at = Math.max(now, nextSlot.get(venue) || 0);
+  nextSlot.set(venue, at + gap);
+  return at - now;
+};
 
 // Streams best bid/ask for any set of markets. Browser sockets are scoped to the open tab and pause
 // while it is hidden; outside a browser (the background engine) they always run.
@@ -81,8 +90,7 @@ export function connectStreams(markets: Market[], onQuote: OnMarketQuote, onStal
     let books = new Map<Market, Book>();
     let cexBooks = new Map<Market, { book: Book; seqId: number }>();
     let resyncing = new Set<Market>();
-    const cexSubscribe = (ws: WebSocket, market: Market) =>
-      ws.send(JSON.stringify({ e: "order_book_subscribe", oid: `${market.ws}-${Date.now()}`, data: { pair: market.ws } }));
+    const cexSubscribe = (market: Market) => JSON.stringify({ e: "order_book_subscribe", oid: `${market.ws}-${Date.now()}`, data: { pair: market.ws } });
     const start = () => {
       if (stopped || !isVisible()) return;
       books = new Map();
@@ -91,12 +99,13 @@ export function connectStreams(markets: Market[], onQuote: OnMarketQuote, onStal
       try { socket = new WebSocket(url); } catch { schedule(); return; }
       const ws = socket;
       sockets.push(ws);
-      // Sends one message per book, spaced as the venue requires, until the socket closes.
+      // Sends one message per book in the venue's shared send slots, until the socket closes.
       const paced = async (messages: string[]) => {
         for (const message of messages) {
+          const delay = slotDelay(venue);
+          if (delay) await pause(delay);
           if (socket !== ws || ws.readyState !== WebSocket.OPEN) return;
           ws.send(message);
-          if (subscribeGapMs[venue]) await pause(subscribeGapMs[venue]!);
         }
       };
       ws.onopen = () => {
@@ -111,7 +120,7 @@ export function connectStreams(markets: Market[], onQuote: OnMarketQuote, onStal
         } else if (venue === "Bitstamp") {
           void paced(names.map((name) => JSON.stringify({ event: "bts:subscribe", data: { channel: `order_book_${name}` } })));
         } else if (venue === "CEX.IO") {
-          void paced(list.map((market) => JSON.stringify({ e: "order_book_subscribe", oid: `${market.ws}-${Date.now()}`, data: { pair: market.ws } })));
+          void paced(list.map(cexSubscribe));
           heartbeatTimer = setInterval(() => { if (socket === ws) ws.send(JSON.stringify({ e: "ping" })); }, 8000);
         } else if (venue === "OKX US") {
           ws.send(JSON.stringify({ id: String(Date.now()), op: "subscribe", args: names.map((instId) => ({ channel: "bbo-tbt", instId })) }));
@@ -153,7 +162,7 @@ export function connectStreams(markets: Market[], onQuote: OnMarketQuote, onStal
               if (!entry || data?.seqId !== entry.seqId + 1) {
                 cexBooks.delete(market);
                 onStale?.(market);
-                if (!resyncing.has(market)) { resyncing.add(market); cexSubscribe(ws, market); }
+                if (!resyncing.has(market)) { resyncing.add(market); void paced([cexSubscribe(market)]); }
                 return;
               }
               entry.seqId = data!.seqId!;
