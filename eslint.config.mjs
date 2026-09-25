@@ -14,6 +14,7 @@ const eslintConfig = defineConfig([
     "next-env.d.ts",
     // Paper engine bundle and packaged executables.
     "dist-engine/**",
+    "dist-tests/**",
     "release/**",
   ]),
   {
