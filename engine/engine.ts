@@ -3,7 +3,7 @@ import { discover, selectMarkets, type Listing } from "../lib/discovery";
 import { batchVenues, fetchBatchBooks, fetchMarketBook } from "../lib/exchanges";
 import { supportedPair, symbols, type Quote, type Venue } from "../lib/market";
 import { keyOf, usdMarket, type Market } from "../lib/markets";
-import { blockReason, chooseTrade, scanOpportunities, type Opportunity, type Rate, type TradeMemory } from "../lib/opportunities";
+import { barrierKey, blockReason, chooseTrade, scanOpportunities, type Opportunity, type Rate, type TradeMemory } from "../lib/opportunities";
 import { fillLeg, LatencyTracker, settle, type LegFill } from "../lib/shadow";
 import { connectStreams } from "../lib/streams";
 import { judge, tokenMap, transferStatus, type TokenMap, type Transfer, type Verdict, type VerdictKind } from "../lib/verify";
@@ -80,7 +80,7 @@ export class Engine {
   private readonly tokens = new Map<Venue, number>();
   private readonly lastBatchAt = new Map<Venue, number>();
   private readonly venueStats = new Map<Venue, VenueStats>();
-  private readonly memory: TradeMemory = { recent: new Map(), consumed: new Map() };
+  private readonly memory: TradeMemory = { recent: new Map(), consumed: new Map(), barriers: new Map() };
   private readonly tradeLog: LoggedTrade[];
   private readonly shadowLog: LoggedShadow[];
   private readonly shadowErrors: number[];
@@ -106,11 +106,16 @@ export class Engine {
   private timers: ReturnType<typeof setInterval>[] = [];
   private stopStreams: () => void = () => {};
   private hour = this.emptyHour();
+  private hours: Record<string, string>[] = [];
 
   constructor(config: EngineConfig, store: Store) {
     this.config = config;
     this.store = store;
-    this.session = store.loadSession(config.startingBalance);
+    const { hour, ...session } = store.loadSession(config.startingBalance);
+    this.session = session;
+    // An hour saved by the last run carries on; if it has since ended, the first roll writes it out.
+    if (hour) this.hour = { ...hour, suspectKeys: new Set(hour.suspectKeys), shadow: { ...hour.shadow } };
+    this.hours = store.readRecentHours(48);
     this.tradeLog = store.readRecentTrades(50).map((row) => ({
       time: Date.parse(row.time), kind: row.kind, path: row.path, notional: Number(row.notional_usd),
       grossPct: Number(row.gross_pct), net: Number(row.net_usd), netPct: Number(row.net_pct),
@@ -123,9 +128,14 @@ export class Engine {
     this.shadowErrors = shadowRows.map((row) => Number(row.realized_net_usd) - Number(row.expected_net_usd)).filter(Number.isFinite);
     // Newest first, so the first row seen for a route is its latest verdict. Saved verdicts count toward the
     // accuracy figures; routes still around are checked again so their details can be shown.
+    const seenRoutes = new Set<string>();
     for (const row of store.readRecentVerdicts(5000)) {
       const id = `${row.group}|${row.route_key}`, kind = row.kind as VerdictKind;
-      if (this.checked.has(id) || (row.group !== "suspect" && row.group !== "traded") || !verdictKinds.includes(kind)) continue;
+      if (!verdictKinds.includes(kind)) continue;
+      // Recent barriers keep blocking their routes until the routes are checked again.
+      if (!seenRoutes.has(row.route_key) && Date.now() - Date.parse(row.time) < VERDICT_TTL_MS) this.recordBarrier(row.route_key, kind);
+      seenRoutes.add(row.route_key);
+      if (this.checked.has(id) || (row.group !== "suspect" && row.group !== "traded")) continue;
       this.checked.set(id, { group: row.group, kind, until: 0 });
     }
     this.trackVenues();
@@ -137,8 +147,9 @@ export class Engine {
     this.ready = true;
     this.timers.push(setInterval(() => this.pollRest(), 250));
     this.timers.push(setInterval(() => this.scan(), 1000));
-    this.timers.push(setInterval(() => this.store.saveSession(this.session), 10_000));
+    this.timers.push(setInterval(() => this.saveSession(), 10_000));
     this.timers.push(setInterval(() => this.rollHour(), 30_000));
+    this.rollHour();
     this.timers.push(setInterval(() => void this.refreshMarkets(), REDISCOVER_MS));
     this.timers.push(setInterval(() => this.probeLatency(), 5_000));
     this.timers.push(setInterval(() => void this.verifyNext(), 5_000));
@@ -149,7 +160,7 @@ export class Engine {
     this.stopStreams();
     for (const timer of this.timers) clearInterval(timer);
     if (this.scanTimer) clearTimeout(this.scanTimer);
-    this.store.saveSession(this.session);
+    this.saveSession();
   }
 
   setRunning(running: boolean) { this.running = running; }
@@ -166,7 +177,8 @@ export class Engine {
     this.memory.consumed.clear();
     this.tradeLog.length = 0;
     this.hour = this.emptyHour();
-    this.store.saveSession(this.session);
+    this.hours = [];
+    this.saveSession();
   }
 
   get summary() { return { coins: this.coverage.coins.length, markets: this.markets.length, source: this.coverage.source, errors: this.coverage.errors }; }
@@ -421,12 +433,29 @@ export class Engine {
           buyTransfer: await transfer(buy.venue), sellTransfer: await transfer(sell.venue), ageMs: age, now });
       }
       this.verdicts.set(target.key, verdict);
+      this.recordBarrier(target.key, verdict.kind);
       this.checked.set(`${group}|${target.key}`, { group, kind: verdict.kind, until: now + (retrySoon ? VERDICT_RETRY_MS : VERDICT_TTL_MS) });
       this.store.appendVerdict({ time: now, group, key: target.key, path: target.path, kind: verdict.kind, grossPct: target.grossPct });
       return verdict;
     } finally {
       this.verifying = false;
     }
+  }
+
+  // A check that finds a barrier blocks paper trades of that coin between those two exchanges, whatever the
+  // gap and quote currencies; different tokens and outlier prices block both directions. A later check that
+  // finds no barrier lifts it. `routeKey` is a cross route's key: cross|COIN|Venue|BASE/QUOTE>Venue|BASE/QUOTE.
+  private recordBarrier(routeKey: string, kind: VerdictKind) {
+    const [type, coin, rest] = [routeKey.split("|")[0], routeKey.split("|")[1], routeKey.split("|").slice(2).join("|")];
+    if (type !== "cross" || !rest?.includes(">")) return;
+    const [buy, sell] = rest.split(">").map((side) => side.split("|")[0] as Venue);
+    const label = ({ "different-tokens": "Known barrier: different tokens", "transfers-blocked": "Known barrier: transfers closed",
+      "price-anomaly": "Known barrier: price outlier" } as Partial<Record<VerdictKind, string>>)[kind];
+    const barriers = this.memory.barriers!;
+    if (label) {
+      barriers.set(barrierKey(coin, buy, sell), label);
+      if (kind !== "transfers-blocked") barriers.set(barrierKey(coin, sell, buy), label);
+    } else if (kind === "no-barrier-found") barriers.delete(barrierKey(coin, buy, sell));
   }
 
   // Runs the check for one suspect route now, bypassing the caches.
@@ -521,7 +550,7 @@ export class Engine {
       rates: this.rates, feeds,
       routes: this.top.slice(0, 15).map((o) => ({ ...o, reason: this.reasons.get(o.key) ?? null })),
       suspectRoutes: this.suspects.map((o) => ({ ...o, since: this.suspectSeen.get(o.key)?.first ?? now, verdict: this.verdicts.get(o.key) ?? null })),
-      currentHour: this.hourRow(), trades: this.tradeLog, hours: this.store.readRecentHours(48),
+      currentHour: this.hourRow(), trades: this.tradeLog, hours: this.hours,
       shadow: {
         since: ses.shadowSince, balance: ses.startingBalance + ses.shadow.realized, pnl: ses.shadow.realized,
         filled: ses.shadow.filled, partial: ses.shadow.partial, missed: ses.shadow.missed, recent: this.shadowLog,
@@ -530,9 +559,18 @@ export class Engine {
         ...accuracy(ses.shadow), errorBins: histogram(this.shadowErrors), errorSample: this.shadowErrors.length,
         verdicts: verdictSummary(this.checked.values()),
         tradedRoutes: this.tradedRoutes.size,
+        barriers: [...this.memory.barriers!].map(([key, reason]) => {
+          const [coin, venues] = key.split("|");
+          const [buy, sell] = venues.split(">");
+          return { coin, buy, sell, reason: reason.replace(/^Known barrier: /, "") };
+        }).sort((a, b) => a.coin.localeCompare(b.coin) || a.buy.localeCompare(b.buy)),
         tradedPending: [...this.tradedRoutes.keys()].filter((key) => !this.checked.has(`traded|${key}`)).length,
       },
     };
+  }
+
+  private saveSession() {
+    this.store.saveSession({ ...this.session, hour: { ...this.hour, suspectKeys: [...this.hour.suspectKeys] } });
   }
 
   private emptyHour() {
@@ -559,6 +597,7 @@ export class Engine {
     if (current.getTime() === this.hour.start) return;
     const row = this.hourRow();
     this.store.appendHourly(row);
+    this.hours = this.store.readRecentHours(48);
     const pct = (n: number | null) => n === null ? "—" : `${n.toFixed(2)}%`;
     console.log(`${new Date().toLocaleTimeString()}  HOUR ${new Date(this.hour.start).toLocaleTimeString([], { hour: "numeric" })}  trades ${row.trades}  paper pnl $${row.pnl.toFixed(2)}  realistic pnl $${row.shadow.realized.toFixed(2)}  best cross ${pct(row.bestNetPct)}  best triangle ${pct(row.bestTriangleNetPct)}  suspect ${row.suspectRoutes}`);
     this.hour = this.emptyHour();

@@ -200,7 +200,13 @@ export type TradeMemory = {
   recent: Map<string, number>;
   // Top-of-book quotes already filled against, by `${market}|${side}`.
   consumed: Map<string, { price: number; size: number }>;
+  // Barriers found by the route checks, by barrierKey(): a coin moving from one exchange to another that
+  // can't be arbitraged whatever the gap, e.g. two different tokens or closed transfers.
+  barriers?: Map<string, string>;
 };
+
+// Checks apply to a coin between two exchanges, whichever currency each side is priced in.
+export const barrierKey = (coin: string, buyVenue: Venue, sellVenue: Venue) => `${coin}|${buyVenue}>${sellVenue}`;
 
 export type TradeRules = { minNet: number; now: number; cooldownMs: number };
 
@@ -208,6 +214,8 @@ export type TradeRules = { minNet: number; now: number; cooldownMs: number };
 // reasons the bot applies.
 export function blockReason(o: Opportunity, memory: TradeMemory, rules: TradeRules): string | null {
   if (o.suspect) return "Suspect gap";
+  const barrier = o.kind === "cross" ? memory.barriers?.get(barrierKey(o.coin, o.venues[0], o.venues[1])) : undefined;
+  if (barrier) return barrier;
   if (o.net <= 0) return "Loses money after costs";
   if (o.net < rules.minNet) return `Below your $${rules.minNet.toFixed(2)} minimum`;
   if (rules.now - (memory.recent.get(o.key) ?? -Infinity) < rules.cooldownMs) return "Traded in the last minute";

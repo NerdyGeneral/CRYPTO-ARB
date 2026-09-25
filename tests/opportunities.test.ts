@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { defaults, emptyMarkets, routesFor, type Quote, type Settings } from "../lib/market";
 import { keyOf, makeMarket, type Market } from "../lib/markets";
 import { selectMarkets } from "../lib/discovery";
-import { blockReason, chooseTrade, scanOpportunities, type Opportunity } from "../lib/opportunities";
+import { barrierKey, blockReason, chooseTrade, scanOpportunities, type Opportunity } from "../lib/opportunities";
 
 const now = 1_000_000;
 const quote = (bid: number, ask: number, size = 1000, receivedAt = now - 100): Quote => ({ bid, bidSize: size, ask, askSize: size, receivedAt, source: "stream" });
@@ -107,6 +107,23 @@ test("a paper trade cannot fill twice against the same unchanged quote", () => {
   assert.equal(blockReason({ ...route("e", 0.03, 10), suspect: true }, memory, options), "Suspect gap");
   assert.equal(blockReason(route("a", 0.0288, 2600), memory, { ...options, now: now + 1000 }), "Traded in the last minute");
   assert.equal(blockReason(route("z", 0.02881, 900), memory, { ...options, now: now + 3000 }), "Quote already used by a paper trade");
+});
+
+test("a barrier found by the route checks blocks the coin between those exchanges at any gap", () => {
+  const route = (venues: Opportunity["venues"]): Opportunity => ({
+    key: venues.join(">"), kind: "cross", coin: "FET", venues, path: "", notional: 50, grossPct: 1.5, net: 0.4, netPct: 0.8,
+    fees: 0.1, conversion: 0, buffer: 0.1, ageMs: 100, suspect: false,
+    legs: [
+      { venue: venues[0], pair: "FET/USD", base: "FET", quote: "USD", side: "buy", price: 1, market: `${venues[0]}|FET/USD`, size: 100, qty: 50, fee: 0.001 },
+      { venue: venues[1], pair: "FET/USD", base: "FET", quote: "USD", side: "sell", price: 1.015, market: `${venues[1]}|FET/USD`, size: 100, qty: 50, fee: 0.001 },
+    ],
+  });
+  const memory = { recent: new Map<string, number>(), consumed: new Map<string, { price: number; size: number }>(),
+    barriers: new Map([[barrierKey("FET", "Binance.US", "Kraken"), "Known barrier: price outlier"]]) };
+  const options = { minNet: 0.25, now, cooldownMs: 60_000 };
+  assert.equal(blockReason(route(["Binance.US", "Kraken"]), memory, options), "Known barrier: price outlier");
+  assert.equal(chooseTrade([route(["Binance.US", "Kraken"])], memory, options), null);
+  assert.equal(chooseTrade([route(["Coinbase", "Kraken"])], memory, options)?.venues[0], "Coinbase");
 });
 
 test("market selection ranks coins by volume, needs two venues and caps books per venue", () => {

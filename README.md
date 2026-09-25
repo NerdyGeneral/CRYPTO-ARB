@@ -23,6 +23,9 @@ The web page only scans while it is open and visible. `ArbiterPaper.exe` runs th
 1. Put `ArbiterPaper.exe` in its own folder, for example `Documents\Arbiter`, and double-click it. Windows SmartScreen may warn that the app is unrecognized because it is not code-signed; choose *More info → Run anyway*.
 2. A console window opens and the dashboard opens in your browser at `http://127.0.0.1:4173`. Keep the console window open; closing it stops the engine (progress is saved).
 3. While it runs, it asks Windows not to sleep. The screen can still turn off. Leave the PC plugged in.
+4. Optional: tick *Start automatically when I sign in to Windows* on the Settings tab. It adds a shortcut to your Startup folder that opens the engine minimized, so it comes back after a Windows Update restart (Windows signs you back in after an update restart if *Use my sign-in info to automatically finish setting up* is on, under Settings → Accounts → Sign-in options).
+
+**Unattended running.** If an exchange connection goes quiet for 90 seconds (for example after the Wi-Fi drops), it is replaced with a new one; in the meantime, prices are polled. Clicking inside the console window no longer pauses the engine (Windows' QuickEdit selection is turned off for that window). The hour in progress is saved every 10 seconds along with the session, so a restart doesn't lose it.
 
 **What it scans.** On start (and every 12 hours) it reads each exchange's public listings and picks the 150 most-traded coins listed on at least two of Coinbase, Kraken, Gemini, Bitstamp, CEX.IO, Binance.US, bitFlyer and OKX US: about 850 order books priced in USD, USDT, USDC and, for triangles, BTC and ETH. CEX.IO is limited to its 80 highest-volume books because its public API allows about 100 requests a minute. If the exchanges can't be reached it uses the last saved listings.
 
@@ -38,7 +41,7 @@ Every estimate includes each exchange's entry-tier taker fee, conversion costs a
 - *Overview* — balances, current routes with their status, suspect gaps with their verdicts, and each exchange's feed and measured latency.
 - *Paper trades* — the reality check for every trade, the trade log and the hourly summary.
 - *Accuracy* — how far the paper numbers are from reality (below), with charts by hour.
-- *Settings* — every option in a form. Budget, minimum profit, fees, buffer and max gap apply on the next scan; coin and exchange changes reload the markets; port, browser and keep-awake apply on the next start; starting balance applies from the next session reset. *Load defaults* fills in the defaults for you to review before saving.
+- *Settings* — every option in a form. Budget, minimum profit, fees, buffer and max gap apply on the next scan; coin and exchange changes reload the markets; start with Windows applies immediately; port, browser and keep-awake apply on the next start; starting balance applies from the next session reset. *Load defaults* fills in the defaults for you to review before saving.
 
 **Realistic results (shadow mode).** Paper trades assume every quote is still there when the order arrives. Shadow mode replays each paper trade as real immediate-or-cancel orders would have landed: each exchange's round trip is measured continuously from your PC, and each leg is checked against that exchange's order book one round trip after the decision. A leg fills only if its price (or better) is still on the book, up to the size shown. The trade is marked *filled*, *one side only* (the other side is sold or bought back at the next prices, fees included) or *missed*. Realistic P&L is what those replays would have made.
 
@@ -57,6 +60,8 @@ Every estimate includes each exchange's entry-tier taker fee, conversion costs a
 - *Transfers closed* — the buy exchange has withdrawals off or the sell exchange has deposits off (Kraken, Coinbase, Bitstamp and CEX.IO publish this; Gemini, Binance.US, bitFlyer and OKX need an account to tell).
 - *Price outlier* — CoinGecko flags one exchange's price as an outlier against the rest of the market.
 - *No barrier found* — none of the above. It could be genuine, but check withdrawal fees and times before trusting it.
+
+When a check finds different tokens, closed transfers or an outlier price, that coin between those two exchanges is blocked from paper trading at any gap, not only above `maxGap`, until a later check finds no barrier. The blocked pairs are listed on the Accuracy tab.
 
 Click a suspect for the individual checks, or *Check now* to re-run them. CoinGecko's free API allows only a few requests a minute, so the first checks take a few minutes after start.
 

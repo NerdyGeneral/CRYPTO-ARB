@@ -49,6 +49,14 @@ jobs:
             $saved = Invoke-RestMethod -Method Post -Uri http://127.0.0.1:4173/api/config -Headers @{ 'X-Arbiter' = '1' } `
               -ContentType 'application/json' -Body '{"settings":{"minNet":0.3}}'
             $refused = Invoke-WebRequest -Method Post -Uri http://127.0.0.1:4173/api/config -ContentType 'application/json' -Body '{}' -SkipHttpErrorCheck
+            # "Start with Windows" adds a shortcut to the Startup folder and removes it again.
+            $link = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Startup\Arbiter Paper Engine.lnk'
+            $autostartOn = Invoke-RestMethod -Method Post -Uri http://127.0.0.1:4173/api/config -Headers @{ 'X-Arbiter' = '1' } `
+              -ContentType 'application/json' -Body '{"startWithWindows":true}'
+            $linkTarget = if (Test-Path $link) { (New-Object -ComObject WScript.Shell).CreateShortcut($link).TargetPath } else { $null }
+            $null = Invoke-RestMethod -Method Post -Uri http://127.0.0.1:4173/api/config -Headers @{ 'X-Arbiter' = '1' } `
+              -ContentType 'application/json' -Body '{"startWithWindows":false}'
+            $linkLeft = Test-Path $link
           }
           finally { Get-Content engine-out.txt, engine-err.txt | Write-Host }
           $state.feeds | Format-Table venue, live, markets, streaming, streamQuotes, restQuotes, restErrors, latencyMs | Out-String | Write-Host
@@ -73,6 +81,9 @@ jobs:
           if ($null -eq $state.shadow -or $null -eq $state.accuracy) { throw "Shadow and accuracy figures are missing" }
           if ($saved.config.settings.minNet -ne 0.3) { throw "Settings were not saved through the dashboard API" }
           if ($refused.StatusCode -ne 404) { throw "A settings change without the dashboard header was accepted" }
+          Write-Host "Startup shortcut target: $linkTarget"
+          if (-not $autostartOn.autostart -or -not "$linkTarget".EndsWith('ArbiterPaper.exe')) { throw "Start with Windows did not create the startup shortcut" }
+          if ($linkLeft) { throw "Turning off Start with Windows left the shortcut behind" }
           # The helper must release the PC once the engine is gone.
           Start-Sleep -Seconds 30
           if (Get-Process -Id $helper.ProcessId -ErrorAction SilentlyContinue) { throw "Keep-awake helper outlived the engine" }

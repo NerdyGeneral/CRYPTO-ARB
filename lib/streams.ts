@@ -61,6 +61,12 @@ const streamUrl: Record<Venue, string | null> = {
 const maxPerSocket: Partial<Record<Venue, number>> = { "CEX.IO": 100, "Binance.US": 1000 };
 const subscribeGapMs: Partial<Record<Venue, number>> = { "CEX.IO": 1000, Bitstamp: 25 };
 const pause = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+// A socket that has received nothing for this long (not even a heartbeat) is treated as dead: after a network
+// drop a connection can stay half-open without ever closing, so it is abandoned and replaced.
+export const SILENT_SOCKET_MS = 90_000;
+const WATCHDOG_MS = 10_000;
+// OKX closes connections idle for 30s, so a text ping keeps quiet ones open.
+const textPing: Partial<Record<Venue, number>> = { "OKX US": 20_000 };
 const nextSlot = new Map<Venue, number>();
 // Reserves the venue's next send slot and returns how long to wait for it.
 const slotDelay = (venue: Venue) => {
@@ -88,6 +94,7 @@ export function connectStreams(markets: Market[], onQuote: OnMarketQuote, onStal
     let attempts = 0;
     let reconnectTimer: Timer | undefined;
     let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
+    let lastMessageAt = 0;
     let books = new Map<Market, Book>();
     let cexBooks = new Map<Market, { book: Book; seqId: number }>();
     let resyncing = new Set<Market>();
@@ -100,6 +107,7 @@ export function connectStreams(markets: Market[], onQuote: OnMarketQuote, onStal
       try { socket = new WebSocket(url); } catch { schedule(); return; }
       const ws = socket;
       sockets.push(ws);
+      lastMessageAt = Date.now();
       // Sends one message per book in the venue's shared send slots, until the socket closes.
       const paced = async (messages: string[]) => {
         for (const message of messages) {
@@ -125,6 +133,7 @@ export function connectStreams(markets: Market[], onQuote: OnMarketQuote, onStal
           heartbeatTimer = setInterval(() => { if (socket === ws) ws.send(JSON.stringify({ e: "ping" })); }, 8000);
         } else if (venue === "OKX US") {
           ws.send(JSON.stringify({ id: String(Date.now()), op: "subscribe", args: names.map((instId) => ({ channel: "bbo-tbt", instId })) }));
+          heartbeatTimer = setInterval(() => { if (socket === ws) ws.send("ping"); }, textPing[venue]);
         } else if (venue === "Binance.US") {
           for (let i = 0; i < names.length; i += 200)
             ws.send(JSON.stringify({ method: "SUBSCRIBE", params: names.slice(i, i + 200).map((name) => `${name}@bookTicker`), id: i + 1 }));
@@ -133,6 +142,7 @@ export function connectStreams(markets: Market[], onQuote: OnMarketQuote, onStal
         }
       };
       ws.onmessage = (event) => {
+        lastMessageAt = Date.now();
         try {
           if (event.data === "ping") { ws.send("pong"); return; }
           const message = JSON.parse(String(event.data)) as Record<string, unknown>;
@@ -203,15 +213,23 @@ export function connectStreams(markets: Market[], onQuote: OnMarketQuote, onStal
       // Node's WebSocket fires error again from inside close() on a failed connection; close once.
       let closing = false;
       ws.onerror = () => { if (closing) return; closing = true; ws.close(); };
-      ws.onclose = () => {
-        if (socket !== ws) return;
-        socket = null; books.clear(); cexBooks.clear();
-        for (const market of list) onStale?.(market);
-        if (heartbeatTimer) clearInterval(heartbeatTimer);
-        heartbeatTimer = undefined;
-        schedule();
-      };
+      ws.onclose = () => { if (socket === ws) abandon(); };
     };
+    // Forgets the current socket and its books and schedules a new connection. A late close event from the
+    // abandoned socket is ignored because it is no longer the current one.
+    const abandon = () => {
+      socket = null; books.clear(); cexBooks.clear();
+      for (const market of list) onStale?.(market);
+      if (heartbeatTimer) clearInterval(heartbeatTimer);
+      heartbeatTimer = undefined;
+      schedule();
+    };
+    const watchdog = setInterval(() => {
+      const ws = socket;
+      if (!ws || Date.now() - lastMessageAt < SILENT_SOCKET_MS) return;
+      abandon();
+      try { ws.close(); } catch { /* Already closed. */ }
+    }, WATCHDOG_MS);
     const schedule = () => {
       if (stopped || !isVisible()) return;
       reconnectTimer = setTimeout(start, Math.min(10000, 1000 * 2 ** Math.min(attempts++, 4)));
@@ -225,7 +243,7 @@ export function connectStreams(markets: Market[], onQuote: OnMarketQuote, onStal
     };
     page?.addEventListener("visibilitychange", visibility);
     start();
-    return () => page?.removeEventListener("visibilitychange", visibility);
+    return () => { clearInterval(watchdog); page?.removeEventListener("visibilitychange", visibility); };
   };
 
   const byVenue = new Map<Venue, Market[]>();
