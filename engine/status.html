@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Arbiter Paper Engine</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23e9a96a'/%3E%3Ctext x='16' y='22' font-size='18' text-anchor='middle' fill='%230b141b'%3E%E2%86%94%3C/text%3E%3C/svg%3E">
+<style>
+  :root {
+    --bg: #0b141b; --panel: #101d27; --line: #22343f; --text: #e8eeea; --muted: #8fa5b1;
+    --accent: #e9a96a; --pos: #7fd4a3; --neg: #e99486; --warn: #e6c56e;
+    --mono: ui-monospace, "Cascadia Mono", Consolas, "SFMono-Regular", Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, "Segoe UI", sans-serif; }
+  main { max-width: 1180px; margin: 0 auto; padding: 20px 16px 48px; }
+  header { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between; padding-bottom: 16px; border-bottom: 1px solid var(--line); }
+  .brand { font-weight: 700; letter-spacing: .04em; }
+  .brand span { color: var(--accent); font-weight: 500; }
+  .pill { font: 12px var(--mono); letter-spacing: .08em; padding: 4px 10px; border-radius: 999px; border: 1px solid var(--line); }
+  .pill.running { color: var(--pos); border-color: #2f5b45; }
+  .pill.paused { color: var(--warn); border-color: #5e5230; }
+  .pill.offline { color: var(--neg); border-color: #5e3530; }
+  .controls { display: flex; gap: 8px; flex-wrap: wrap; }
+  button { font: 600 13px system-ui, sans-serif; color: var(--bg); background: var(--accent); border: 0; border-radius: 6px; padding: 8px 14px; cursor: pointer; }
+  button.ghost { background: transparent; color: var(--muted); border: 1px solid var(--line); }
+  button:disabled { opacity: .5; cursor: default; }
+  .note { color: var(--muted); margin: 14px 0 0; }
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin: 20px 0; }
+  .stat { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px; min-width: 0; }
+  .stat small { display: block; color: var(--muted); font: 11px var(--mono); letter-spacing: .08em; text-transform: uppercase; }
+  .stat strong { display: block; font: 600 22px var(--mono); margin: 6px 0 2px; overflow-wrap: anywhere; }
+  .stat span { color: var(--muted); font-size: 12px; }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; margin-top: 16px; }
+  section h2 { font-size: 15px; margin: 0; padding: 14px 16px 4px; }
+  section p.sub { margin: 0; padding: 0 16px 10px; color: var(--muted); font-size: 12px; }
+  .scroll { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 8px 16px; border-top: 1px solid var(--line); white-space: nowrap; }
+  th { color: var(--muted); font: 11px var(--mono); letter-spacing: .06em; text-transform: uppercase; }
+  td.num, th.num { text-align: right; font-family: var(--mono); }
+  .pos { color: var(--pos); } .neg { color: var(--neg); } .muted { color: var(--muted); } .warn { color: var(--warn); }
+  .empty { padding: 16px; color: var(--muted); }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .grid2 section { margin-top: 16px; min-width: 0; }
+  @media (max-width: 860px) { .grid2 { grid-template-columns: 1fr; } }
+  footer { color: var(--muted); font-size: 12px; margin-top: 20px; overflow-wrap: anywhere; }
+  code { font-family: var(--mono); color: var(--text); }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div class="brand">ARBITER <span>/ PAPER ENGINE</span></div>
+    <div class="controls">
+      <span id="state" class="pill offline">CONNECTING</span>
+      <button id="toggle" disabled>Pause</button>
+      <button id="reset" class="ghost" disabled>Reset session</button>
+    </div>
+  </header>
+  <p class="note">Simulated trades only. Nothing is sent to an exchange. Results assume pre-funded balances on both exchanges, fills at the quoted size, and no transfer or withdrawal costs.</p>
+
+  <div class="stats">
+    <div class="stat"><small>Paper balance</small><strong id="balance">—</strong><span id="start">&nbsp;</span></div>
+    <div class="stat"><small>Paper P&amp;L</small><strong id="pnl">—</strong><span>after fees + buffer</span></div>
+    <div class="stat"><small>Simulated trades</small><strong id="trades">—</strong><span id="scans">&nbsp;</span></div>
+    <div class="stat"><small>Best net this hour</small><strong id="bestNet">—</strong><span>tradable routes only</span></div>
+    <div class="stat"><small>Running for</small><strong id="uptime">—</strong><span id="since">&nbsp;</span></div>
+  </div>
+
+  <section>
+    <h2>Exchange feeds</h2>
+    <p class="sub">Live = pairs with a quote under 12 seconds old. Streaming feeds update instantly; others are polled.</p>
+    <div class="scroll"><table><thead><tr><th>Exchange</th><th class="num">Live pairs</th><th>Source</th><th class="num">Last quote</th><th class="num">Poll errors</th></tr></thead><tbody id="feeds"></tbody></table></div>
+  </section>
+
+  <section>
+    <h2>Current best routes</h2>
+    <p class="sub">Buy on the first exchange, sell on the second. Net includes both taker fees and the price buffer.</p>
+    <div class="scroll"><table><thead><tr><th>Pair</th><th>Route</th><th class="num">Buy ask</th><th class="num">Sell bid</th><th class="num">Raw gap</th><th class="num">Est. net</th></tr></thead><tbody id="routes"></tbody></table></div>
+  </section>
+
+  <section>
+    <h2>Suspect gaps (not traded)</h2>
+    <p class="sub" id="suspectNote">Raw gaps above the max believable gap. These usually mean transfers are paused or the two listings are not the same token.</p>
+    <div class="scroll"><table><thead><tr><th>Pair</th><th>Route</th><th class="num">Raw gap</th><th class="num">Would-be net</th></tr></thead><tbody id="suspects"></tbody></table></div>
+  </section>
+
+  <div class="grid2">
+    <section>
+      <h2>Hourly summary</h2>
+      <p class="sub">One row per hour, saved to <code>hourly.csv</code>.</p>
+      <div class="scroll"><table><thead><tr><th>Hour</th><th class="num">Trades</th><th class="num">P&amp;L</th><th class="num">Best net</th><th class="num">Suspect</th></tr></thead><tbody id="hours"></tbody></table></div>
+    </section>
+    <section>
+      <h2>Paper trade log</h2>
+      <p class="sub">Latest 50, full log in <code>trades.csv</code>.</p>
+      <div class="scroll"><table><thead><tr><th>Time</th><th>Pair</th><th>Route</th><th class="num">Net</th></tr></thead><tbody id="log"></tbody></table></div>
+    </section>
+  </div>
+
+  <footer id="footer">&nbsp;</footer>
+</main>
+<script>
+  const $ = (id) => document.getElementById(id);
+  const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+  const money = (n, d = 2) => (n < 0 ? "−" : "") + "$" + Math.abs(n).toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d });
+  const signed = (n) => (n >= 0 ? "+" : "−") + money(Math.abs(n), Math.abs(n) < 1 && n !== 0 ? 3 : 2);
+  const pct = (n) => n === null || n === undefined || n === "" || Number.isNaN(Number(n)) ? "—" : (Number(n) >= 0 ? "+" : "−") + Math.abs(Number(n)).toFixed(2) + "%";
+  const price = (n) => money(n, n < 0.001 ? 10 : n < 1 ? 6 : n < 10 ? 4 : 2);
+  const cls = (n) => n > 0 ? "pos" : n < 0 ? "neg" : "muted";
+  const ago = (ms) => ms === null ? "never" : ms < 1500 ? "now" : ms < 90000 ? Math.round(ms / 1000) + "s ago" : Math.round(ms / 60000) + "m ago";
+  const duration = (ms) => { const m = Math.floor(ms / 60000), h = Math.floor(m / 60), d = Math.floor(h / 24); return d ? `${d}d ${h % 24}h` : h ? `${h}h ${m % 60}m` : `${m}m`; };
+  const rows = (id, list, render, cols, empty) => { $(id).innerHTML = list.length ? list.map(render).join("") : `<tr><td colspan="${cols}" class="empty">${empty}</td></tr>`; };
+  let running = null;
+
+  async function refresh() {
+    let s;
+    try { const r = await fetch("/api/state", { cache: "no-store" }); if (!r.ok) throw new Error(); s = await r.json(); }
+    catch { $("state").className = "pill offline"; $("state").textContent = "ENGINE STOPPED"; $("toggle").disabled = $("reset").disabled = true; return; }
+    running = s.running;
+    $("state").className = "pill " + (s.running ? "running" : "paused");
+    $("state").textContent = s.running ? "RUNNING" : "PAUSED";
+    $("toggle").disabled = $("reset").disabled = false;
+    $("toggle").textContent = s.running ? "Pause" : "Resume";
+    const ses = s.session;
+    $("balance").textContent = money(ses.balance);
+    $("start").textContent = "Started at " + money(ses.startingBalance);
+    $("pnl").textContent = signed(ses.pnl); $("pnl").className = cls(ses.pnl);
+    $("trades").textContent = ses.tradeCount.toLocaleString();
+    $("scans").textContent = ses.scans.toLocaleString() + " scans";
+    const best = s.currentHour.bestNetPct;
+    $("bestNet").textContent = pct(best); $("bestNet").className = best === null ? "" : cls(best);
+    $("uptime").textContent = duration(s.now - s.startedAt);
+    $("since").textContent = "session since " + new Date(ses.startedAt).toLocaleDateString();
+
+    rows("feeds", s.feeds, (f) => `<tr><td>${esc(f.venue)}</td><td class="num ${f.live === f.pairs ? "pos" : f.live ? "warn" : "neg"}">${f.live}/${f.pairs}</td>` +
+      `<td>${f.streaming ? '<span class="pos">Streaming</span>' : f.restQuotes ? '<span class="warn">Polling</span>' : '<span class="neg">No data</span>'}</td>` +
+      `<td class="num muted">${ago(f.lastQuoteAgoMs)}</td><td class="num muted">${f.restErrors}</td></tr>`, 5, "No exchanges selected.");
+
+    const tradable = s.routes.filter((r) => !r.suspect);
+    rows("routes", tradable, (r) => `<tr><td><strong>${esc(r.symbol)}</strong></td><td>${esc(r.buy)} → ${esc(r.sell)}</td><td class="num">${price(r.ask)}</td><td class="num">${price(r.bid)}</td>` +
+      `<td class="num ${r.grossPct > 0 ? "pos" : "muted"}">${pct(r.grossPct)}</td><td class="num ${cls(r.net)}">${signed(r.net)} <span class="muted">${pct(r.netPct)}</span></td></tr>`, 6,
+      "Waiting for quotes from at least two exchanges…");
+
+    rows("suspects", s.suspectRoutes, (r) => `<tr><td><strong>${esc(r.symbol)}</strong></td><td>${esc(r.buy)} → ${esc(r.sell)}</td><td class="num warn">${pct(r.grossPct)}</td><td class="num muted">${signed(r.net)}</td></tr>`, 4,
+      "None right now.");
+    $("suspectNote").textContent = `Raw gaps above ${s.settings.maxGap}% (maxGap in config.json). These usually mean transfers are paused or the two listings are not the same token, so they are never paper-traded.`;
+
+    const current = { ...s.currentHour, current: true };
+    const hours = [current, ...s.hours.map((h) => ({ hour: h.hour, trades: Number(h.trades), pnl: Number(h.pnl_usd), bestNetPct: h.best_net_pct === "" ? null : Number(h.best_net_pct), suspectRoutes: Number(h.suspect_routes) }))];
+    rows("hours", hours, (h) => `<tr><td>${new Date(h.hour).toLocaleString([], { month: "short", day: "numeric", hour: "numeric" })}${h.current ? ' <span class="muted">(now)</span>' : ""}</td>` +
+      `<td class="num">${h.trades}</td><td class="num ${cls(h.pnl)}">${signed(h.pnl)}</td><td class="num ${h.bestNetPct === null ? "muted" : cls(h.bestNetPct)}">${pct(h.bestNetPct)}</td><td class="num ${h.suspectRoutes ? "warn" : "muted"}">${h.suspectRoutes}</td></tr>`, 5, "");
+
+    rows("log", s.trades, (t) => `<tr><td class="muted">${new Date(t.time).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit", second: "2-digit" })}</td>` +
+      `<td><strong>${esc(t.symbol)}</strong></td><td>${esc(t.buy)} → ${esc(t.sell)}</td><td class="num ${cls(t.net)}">${signed(t.net)}</td></tr>`, 4,
+      "No paper trades yet. A trade is logged only when a route's estimated net clears your minimum after fees.");
+
+    $("footer").innerHTML = `Data folder: <code>${esc(s.dataDir)}</code> · Budget ${money(s.settings.budget)} per trade · minimum net ${money(s.settings.minNet)} · buffer ${s.settings.buffer}% per side`;
+  }
+
+  async function post(path, body) {
+    await fetch(path, { method: "POST", headers: { "Content-Type": "application/json", "X-Arbiter": "1" }, body: JSON.stringify(body || {}) });
+    refresh();
+  }
+  $("toggle").onclick = () => post("/api/running", { running: !running });
+  $("reset").onclick = () => { if (confirm("Reset the paper session? Balance returns to the starting amount; the old trade and hourly logs are archived, not deleted.")) post("/api/reset"); };
+  refresh();
+  setInterval(refresh, 2000);
+</script>
+</body>
+</html>

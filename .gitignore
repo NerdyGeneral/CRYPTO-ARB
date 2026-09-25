@@ -45,3 +45,8 @@ next-env.d.ts
 /.codex/
 /outputs/
 /work/
+# paper engine build output and local run data
+/dist-engine/
+/release/
+/.cache/
+arbiter-data/

@@ -26,14 +26,17 @@ export function connectMarketStreams(universe: Universe, onQuote: OnQuote, onSta
   if (typeof WebSocket === "undefined") return () => {};
   let stopped = false;
   const sockets: WebSocket[] = [];
-  const timers: number[] = [];
-  const isVisible = () => !document.hidden;
+  type Timer = ReturnType<typeof setTimeout>;
+  const timers: Timer[] = [];
+  // Outside a browser (the background engine) there is no page visibility, so streams always run.
+  const page = typeof document === "undefined" ? undefined : document;
+  const isVisible = () => !page?.hidden;
 
   const connect = (venue: "Coinbase" | "Kraken" | "Gemini" | "Bitstamp" | "CEX.IO" | "OKX US" | "Crypto.com", url: string) => {
     let socket: WebSocket | null = null;
     let attempts = 0;
-    let reconnectTimer: number | undefined;
-    let heartbeatTimer: number | undefined;
+    let reconnectTimer: Timer | undefined;
+    let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
     let books = new Map<SymbolName, Levels>();
     let cexBooks = new Map<SymbolName, Levels & { seqId: number }>();
     let resyncing = new Set<SymbolName>();
@@ -58,7 +61,7 @@ export function connectMarketStreams(universe: Universe, onQuote: OnQuote, onSta
           for (const asset of assets) ws.send(JSON.stringify({ event: "bts:subscribe", data: { channel: `order_book_${asset.toLowerCase()}usd` } }));
         } else if (venue === "CEX.IO") {
           for (const asset of assets) ws.send(JSON.stringify({ e: "order_book_subscribe", oid: `${asset}-${Date.now()}`, data: { pair: `${asset}-USD` } }));
-          heartbeatTimer = window.setInterval(() => { if (socket === ws) ws.send(JSON.stringify({ e: "ping" })); }, 8000);
+          heartbeatTimer = setInterval(() => { if (socket === ws) ws.send(JSON.stringify({ e: "ping" })); }, 8000);
         } else if (venue === "OKX US") {
           ws.send(JSON.stringify({ id: String(Date.now()), op: "subscribe", args: assets.map((asset) => ({ channel: "bbo-tbt", instId: `${asset}-USD` })) }));
         } else {
@@ -182,23 +185,25 @@ export function connectMarketStreams(universe: Universe, onQuote: OnQuote, onSta
           if (quote) onQuote(symbol, "Coinbase", quote);
         } catch { /* Ignore malformed exchange messages; the REST fallback remains available. */ }
       };
-      ws.onerror = () => ws.close();
-      ws.onclose = () => { if (socket === ws) { socket = null; books.clear(); cexBooks.clear(); for (const asset of assets) onStale?.(asset, venue); if (heartbeatTimer) window.clearInterval(heartbeatTimer); heartbeatTimer = undefined; schedule(); } };
+      // Node's WebSocket fires error again from inside close() on a failed connection; close once.
+      let closing = false;
+      ws.onerror = () => { if (closing) return; closing = true; ws.close(); };
+      ws.onclose = () => { if (socket === ws) { socket = null; books.clear(); cexBooks.clear(); for (const asset of assets) onStale?.(asset, venue); if (heartbeatTimer) clearInterval(heartbeatTimer); heartbeatTimer = undefined; schedule(); } };
     };
     const schedule = () => {
       if (stopped || !isVisible()) return;
-      reconnectTimer = window.setTimeout(start, Math.min(10000, 1000 * 2 ** Math.min(attempts++, 4)));
+      reconnectTimer = setTimeout(start, Math.min(10000, 1000 * 2 ** Math.min(attempts++, 4)));
       timers.push(reconnectTimer);
     };
     const visibility = () => {
       if (!isVisible()) {
-        if (reconnectTimer) window.clearTimeout(reconnectTimer);
+        if (reconnectTimer) clearTimeout(reconnectTimer);
         socket?.close();
       } else if (!socket) start();
     };
-    document.addEventListener("visibilitychange", visibility);
+    page?.addEventListener("visibilitychange", visibility);
     start();
-    return () => document.removeEventListener("visibilitychange", visibility);
+    return () => page?.removeEventListener("visibilitychange", visibility);
   };
 
   const cleanups: (() => void)[] = [];
@@ -212,7 +217,7 @@ export function connectMarketStreams(universe: Universe, onQuote: OnQuote, onSta
   return () => {
     stopped = true;
     cleanups.forEach((cleanup) => cleanup());
-    timers.forEach((timer) => window.clearTimeout(timer));
+    timers.forEach((timer) => clearTimeout(timer));
     sockets.forEach((socket) => socket.close());
   };
 }

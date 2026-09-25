@@ -12,13 +12,13 @@ export type PublicFee = { rate: number; checkedAt: number; url: string };
 export type PublicFeesResponse = { checkedAt: number; rates: Partial<Record<Venue, PublicFee>>; errors: string[] };
 export type Settings = {
   budget: number; minNet: number; coinbaseFee: number; krakenFee: number;
-  geminiFee: number; bitstampFee: number; cexFee: number; cryptoComFee: number; bitflyerFee: number; okxFee: number; buffer: number;
+  geminiFee: number; bitstampFee: number; cexFee: number; cryptoComFee: number; bitflyerFee: number; okxFee: number; buffer: number; maxGap: number;
 };
 export type Route = {
   key: string; symbol: SymbolName; buy: Venue; sell: Venue; ask: number; bid: number;
   quantity: number; notional: number; grossPct: number; net: number; netPct: number;
   buyFee: number; sellFee: number; movementCost: number;
-  ageMs: number; streamLegs: number; indicative: boolean;
+  ageMs: number; streamLegs: number; indicative: boolean; suspect: boolean;
 };
 export type Trade = Route & { id: string; time: number };
 export type Session = { balance: number; scans: number; tradeCount: number; trades: Trade[] };
@@ -48,9 +48,12 @@ export const feeKey: Record<Venue, keyof Settings> = {
 export const defaults: Settings = {
   budget: 50, minNet: 0.25, coinbaseFee: 0.9, krakenFee: 0.8,
   geminiFee: 1.2, bitstampFee: 0.5, cexFee: 0.25, cryptoComFee: 0.5, bitflyerFee: 0.1, okxFee: 0.5, buffer: 0.1,
+  // Gaps wider than this almost always mean the two books are not interchangeable (transfers
+  // paused, a different token, a halted market), so they are flagged and never paper-traded.
+  maxGap: 2,
 };
 export const settingRange = (key: keyof Settings): [number, number] =>
-  key === "budget" ? [5, 100000] : key === "minNet" ? [0, 10000] : [0, 10];
+  key === "budget" ? [5, 100000] : key === "minNet" ? [0, 10000] : key === "maxGap" ? [0.1, 50] : [0, 10];
 export const newSession: Session = { balance: 500, scans: 0, tradeCount: 0, trades: [] };
 export const money = (n: number, digits = 2) => new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", minimumFractionDigits: digits, maximumFractionDigits: digits }).format(n);
 export const signedMoney = (n: number) => `${n >= 0 ? "+" : "−"}${money(Math.abs(n))}`;
@@ -96,8 +99,9 @@ export function routesFor(snapshot: Snapshot | null, settings: Settings, balance
         ageMs: Math.max(now - entry.receivedAt, now - exit.receivedAt),
         streamLegs: Number(entry.source === "stream") + Number(exit.source === "stream"),
         indicative: buy === "Crypto.com" || sell === "Crypto.com",
+        suspect: (exit.bid / entry.ask - 1) * 100 > settings.maxGap,
       });
     }
   }
-  return result.sort((a, b) => Number(a.indicative) - Number(b.indicative) || b.net - a.net);
+  return result.sort((a, b) => Number(a.indicative) - Number(b.indicative) || Number(a.suspect) - Number(b.suspect) || b.net - a.net);
 }
