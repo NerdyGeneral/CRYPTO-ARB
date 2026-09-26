@@ -5,7 +5,7 @@ import path from "node:path";
 import { isSea } from "node:sea";
 import statusPage from "./status.html";
 import { Engine } from "./engine";
-import { Store, defaultConfig, resolveDataDir } from "./store";
+import { Store, carryRange, defaultConfig, resolveDataDir } from "./store";
 import { settingRange, type Settings } from "../lib/market";
 
 // An unattended run should log a stray error and keep scanning rather than exit.
@@ -116,7 +116,7 @@ const server = http.createServer(async (request, response) => {
   if (request.method === "GET" && path === "/api/state") return send(200, "application/json", JSON.stringify(engine.state()));
   if (request.method === "GET" && path === "/api/config") {
     const ranges = Object.fromEntries(Object.keys(defaultConfig.settings).map((key) => [key, settingRange(key as keyof Settings)]));
-    return send(200, "application/json", JSON.stringify({ config: engine.currentConfig, defaults: defaultConfig, ranges, autostartAvailable }));
+    return send(200, "application/json", JSON.stringify({ config: engine.currentConfig, defaults: defaultConfig, ranges, carryRanges: carryRange, autostartAvailable }));
   }
   // Controls need a custom header, which a page on another site cannot send without a preflight this server never approves.
   if (request.method === "POST" && request.headers["x-arbiter"] === "1") {

@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { isSea } from "node:sea";
 import { emptyTally, type ShadowTally, type VerdictGroup } from "../lib/accuracy";
+import type { CarryPosition } from "../lib/carry";
 import type { Listing } from "../lib/discovery";
 import { defaults, settingRange, venues, type Settings, type Venue } from "../lib/market";
 import type { Opportunity } from "../lib/opportunities";
@@ -24,9 +25,35 @@ export type EngineConfig = {
   extraCoins: string[];
   excludeCoins: string[];
   triangular: boolean;
+  // Check the routes that use a book the moment its price changes, rather than only on the half-second scan.
+  reactToPrices: boolean;
   // Cost of converting a dollar stablecoin to or from USD, in percent (Kraken's entry tier is 0.20%).
   conversionFee: number;
   settings: Settings;
+  carry: CarryConfig;
+};
+
+// Spot vs futures carry (paper). Percentages are in percent; capital is a separate paper account.
+export type CarryConfig = {
+  enabled: boolean; capital: number; maxPositions: number;
+  marginBuffer: number; // collateral held against each short, % of its notional
+  futuresFee: number; // taker fee per side, %
+  minNetApr: number; // open when the expected net yearly return on the capital used is at least this, %
+  exitApr: number; // close when the last 6 hours of funding average below this yearly rate, %
+  holdDays: number; // expected holding time, to spread the round-trip costs
+};
+
+// The persisted carry account: free cash, open positions, recent closed ones and the last settlement seen per contract.
+export type CarryState = {
+  startedAt: number; capital: number; cash: number; positions: CarryPosition[]; closed: CarryPosition[];
+  lastFunding: Record<string, number>; coins: string[];
+};
+
+export const carryDefaults: CarryConfig = {
+  enabled: true, capital: 5000, maxPositions: 3, marginBuffer: 100, futuresFee: 0.05, minNetApr: 8, exitApr: 0, holdDays: 14,
+};
+export const carryRange: Record<Exclude<keyof CarryConfig, "enabled">, [number, number]> = {
+  capital: [100, 10_000_000], maxPositions: [1, 20], marginBuffer: [10, 300], futuresFee: [0, 1], minNetApr: [-100, 1000], exitApr: [-100, 1000], holdDays: [1, 365],
 };
 
 export type SessionFile = {
@@ -67,8 +94,10 @@ export const defaultConfig: EngineConfig = {
   extraCoins: [],
   excludeCoins: [],
   triangular: true,
+  reactToPrices: true,
   conversionFee: 0.2,
   settings: defaults,
+  carry: carryDefaults,
 };
 
 const TRADES_HEADER = "time,kind,path,notional_usd,gross_pct,net_usd,net_pct,fees_usd,conversion_usd,buffer_usd,quote_age_ms,legs";
@@ -76,6 +105,8 @@ const HOURLY_HEADER = "hour,scans,trades,pnl_usd,best_net_pct,best_triangle_net_
   "shadow_expected_usd,shadow_pnl_usd,shadow_abs_error_usd,shadow_filled,shadow_partial,shadow_missed,shadow_losses";
 const SHADOW_HEADER = "time,kind,path,expected_net_usd,realized_net_usd,outcome,filled_fraction,latency_ms,unwound";
 const VERDICT_HEADER = "time,group,route_key,path,kind,gross_pct";
+const CARRY_HEADER = "time,event,position,coin,contract,spot_venue,contracts,spot_qty,spot_price,futures_price,funding_rate,amount_usd,net_usd,note";
+const FUNDING_HEADER = "time,contract,coin,rate,index_price";
 
 // Validates a config from disk or the dashboard; anything missing or out of range takes its default.
 export function normalizeConfig(raw: unknown): EngineConfig {
@@ -103,9 +134,16 @@ export function normalizeConfig(raw: unknown): EngineConfig {
     extraCoins: coins(saved.extraCoins),
     excludeCoins: coins(saved.excludeCoins),
     triangular: bool(saved.triangular, defaultConfig.triangular),
+    reactToPrices: bool(saved.reactToPrices, defaultConfig.reactToPrices),
     conversionFee: number(saved.conversionFee, defaultConfig.conversionFee, 0, 5),
     settings,
+    carry: {
+      enabled: bool(saved.carry && (saved.carry as Partial<CarryConfig>).enabled, carryDefaults.enabled),
+      ...Object.fromEntries(Object.entries(carryRange).map(([key, [min, max]]) =>
+        [key, number(((saved.carry || {}) as Record<string, unknown>)[key], carryDefaults[key as keyof typeof carryRange], min, max)])),
+    } as CarryConfig,
   };
+  config.carry.maxPositions = Math.round(config.carry.maxPositions);
   return config;
 }
 
@@ -141,6 +179,9 @@ export class Store {
   private readonly listingFile: string;
   private readonly shadowFile: string;
   private readonly verdictFile: string;
+  private readonly carryFile: string;
+  private readonly carryLog: string;
+  private readonly fundingFile: string;
 
   constructor(dir: string) {
     this.dir = dir;
@@ -152,8 +193,12 @@ export class Store {
     this.listingFile = path.join(dir, "listings.json");
     this.shadowFile = path.join(dir, "shadow.csv");
     this.verdictFile = path.join(dir, "verdicts.csv");
+    this.carryFile = path.join(dir, "carry.json");
+    this.carryLog = path.join(dir, "carry.csv");
+    this.fundingFile = path.join(dir, "funding.csv");
     // Logs written by an older version have different columns; set them aside rather than mix formats.
-    for (const [file, header] of [[this.tradesFile, TRADES_HEADER], [this.hourlyFile, HOURLY_HEADER], [this.shadowFile, SHADOW_HEADER], [this.verdictFile, VERDICT_HEADER]]) {
+    for (const [file, header] of [[this.tradesFile, TRADES_HEADER], [this.hourlyFile, HOURLY_HEADER], [this.shadowFile, SHADOW_HEADER], [this.verdictFile, VERDICT_HEADER],
+      [this.carryLog, CARRY_HEADER], [this.fundingFile, FUNDING_HEADER]]) {
       const first = fs.existsSync(file) ? fs.readFileSync(file, "utf8").split("\n", 1)[0] : header;
       if (first !== header) fs.renameSync(file, file.replace(/\.csv$/, `-old-format-${stamp()}.csv`));
     }
@@ -232,13 +277,37 @@ export class Store {
 
   readRecentVerdicts(limit: number): Record<string, string>[] { return this.readCsvTail(this.verdictFile, limit); }
 
+  loadCarry(capital: number): CarryState {
+    const saved = readJson(this.carryFile) as Partial<CarryState> | null;
+    const fresh: CarryState = { startedAt: Date.now(), capital, cash: capital, positions: [], closed: [], lastFunding: {}, coins: [] };
+    if (!saved || typeof saved.cash !== "number" || !Number.isFinite(saved.cash) || !Array.isArray(saved.positions)) return fresh;
+    return { ...fresh, ...saved, closed: Array.isArray(saved.closed) ? saved.closed : [], lastFunding: saved.lastFunding || {}, coins: saved.coins || [] } as CarryState;
+  }
+
+  saveCarry(state: CarryState) { writeJson(this.carryFile, state); }
+
+  appendCarryEvent(row: { time: number; event: string; position: CarryPosition; spotPrice?: number; futuresPrice?: number; rate?: number; amount?: number; net?: number; note?: string }) {
+    const p = row.position;
+    const line = [new Date(row.time).toISOString(), row.event, p.id, p.coin, p.perpId, p.spotVenue, p.contracts, p.spotQty, row.spotPrice, row.futuresPrice,
+      row.rate, row.amount?.toFixed(4), row.net?.toFixed(4), row.note].map(csvCell).join(",");
+    this.append(this.carryLog, CARRY_HEADER, line);
+  }
+
+  readRecentCarryEvents(limit: number): Record<string, string>[] { return this.readCsvTail(this.carryLog, limit); }
+
+  appendFunding(row: { time: number; contract: string; coin: string; rate: number; index: number }) {
+    this.append(this.fundingFile, FUNDING_HEADER, [new Date(row.time).toISOString(), row.contract, row.coin, row.rate, row.index].map(csvCell).join(","));
+  }
+
+  readFunding(limit: number): Record<string, string>[] { return this.readCsvTail(this.fundingFile, limit); }
+
   readRecentTrades(limit: number): Record<string, string>[] { return this.readCsvTail(this.tradesFile, limit); }
   readRecentHours(limit: number): Record<string, string>[] { return this.readCsvTail(this.hourlyFile, limit); }
 
   // Keep the CSV files but archive them so a reset starts a clean log.
   archiveLogs() {
     const suffix = stamp();
-    for (const file of [this.tradesFile, this.hourlyFile, this.shadowFile, this.verdictFile]) if (fs.existsSync(file)) fs.renameSync(file, file.replace(/\.csv$/, `-${suffix}.csv`));
+    for (const file of [this.tradesFile, this.hourlyFile, this.shadowFile, this.verdictFile, this.carryLog]) if (fs.existsSync(file)) fs.renameSync(file, file.replace(/\.csv$/, `-${suffix}.csv`));
   }
 
   private append(file: string, header: string, line: string) {

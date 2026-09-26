@@ -1,12 +1,14 @@
 import { accuracy, addReplay, emptyTally, histogram, verdictKinds, verdictSummary, type VerdictGroup } from "../lib/accuracy";
 import { discover, selectMarkets, type Listing } from "../lib/discovery";
 import { batchVenues, fetchBatchBooks, fetchMarketBook } from "../lib/exchanges";
-import { supportedPair, symbols, type Quote, type Venue } from "../lib/market";
+import type { SpotSide } from "../lib/carry";
+import { feeKey, supportedPair, symbols, type Quote, type Venue } from "../lib/market";
 import { keyOf, usdMarket, type Market } from "../lib/markets";
-import { barrierKey, blockReason, chooseTrade, scanOpportunities, type Opportunity, type Rate, type TradeMemory } from "../lib/opportunities";
+import { barrierKey, blockReason, chooseTrade, indexRoutes, scanMarket, scanOpportunities, type Opportunity, type Rate, type RouteIndex, type TradeMemory } from "../lib/opportunities";
 import { fillLeg, LatencyTracker, settle, type LegFill } from "../lib/shadow";
 import { connectStreams } from "../lib/streams";
 import { judge, tokenMap, transferStatus, type TokenMap, type Transfer, type Verdict, type VerdictKind } from "../lib/verify";
+import { Carry } from "./carry";
 import { normalizeConfig, Store, type EngineConfig, type HourlyRow, type SessionFile, type ShadowRecord, type TradeRecord } from "./store";
 
 // A quote counts as streamed while its feed has updated within this window; otherwise REST fills in.
@@ -15,11 +17,15 @@ const REST_REFRESH_MS = 6_000;
 const REST_BACKOFF_MS = 30_000;
 const BATCH_INTERVAL_MS = 3_000;
 const ROUTE_COOLDOWN_MS = 60_000;
-const SCAN_SPACING_MS = 500;
+// Every route is rescanned on this interval for the dashboard, the hourly stats and stablecoin rate changes;
+// trading itself reacts to each price change as it arrives.
+const FULL_SCAN_MS = 500;
 const REDISCOVER_MS = 12 * 60 * 60 * 1000;
 const QUOTE_TTL_MS = 12_000;
-// Shadow mode: time from seeing a quote to sending orders, and how often to re-measure each venue's round trip.
-const DECISION_MS = 30;
+// Shadow mode: time to prepare and send orders once a trade is chosen (added to the measured decision time),
+// and how often to re-measure each venue's round trip.
+const ORDER_PREP_MS = 5;
+const REACTION_SAMPLES = 1000;
 const LATENCY_PROBE_MS = 30_000;
 // Route verification: one route at a time, spaced for CoinGecko's keyless limit, results kept for hours.
 // Suspect gaps are checked first, then routes that were paper-traded, to measure the max-gap rule both ways.
@@ -101,12 +107,15 @@ export class Engine {
   private top: Opportunity[] = [];
   private suspects: Opportunity[] = [];
   private rates: Record<string, Rate> = {};
-  private lastScanAt = 0;
-  private scanTimer: ReturnType<typeof setTimeout> | undefined;
+  private index: RouteIndex = indexRoutes([]);
+  // How long each check took from a price change to a decision, most recent last.
+  private readonly reactionMs: number[] = [];
+  private eventTrades = 0;
   private timers: ReturnType<typeof setInterval>[] = [];
   private stopStreams: () => void = () => {};
   private hour = this.emptyHour();
   private hours: Record<string, string>[] = [];
+  private readonly carry: Carry;
 
   constructor(config: EngineConfig, store: Store) {
     this.config = config;
@@ -139,28 +148,33 @@ export class Engine {
       this.checked.set(id, { group: row.group, kind, until: 0 });
     }
     this.trackVenues();
+    this.carry = new Carry(() => this.config.carry, store, (coin) => this.spotSides(coin),
+      (line) => console.log(`${new Date().toLocaleTimeString()}  ${line}`));
   }
 
   async start() {
+    // The coins with US perpetual futures are followed on spot too, so the carry has prices for both legs.
+    if (this.config.carry.enabled) await this.carry.refreshProducts().catch(() => { /* Retried by the carry's own schedule. */ });
     await this.loadMarkets();
     this.connect();
     this.ready = true;
     this.timers.push(setInterval(() => this.pollRest(), 250));
-    this.timers.push(setInterval(() => this.scan(), 1000));
+    this.timers.push(setInterval(() => this.scan(), FULL_SCAN_MS));
     this.timers.push(setInterval(() => this.saveSession(), 10_000));
     this.timers.push(setInterval(() => this.rollHour(), 30_000));
     this.rollHour();
     this.timers.push(setInterval(() => void this.refreshMarkets(), REDISCOVER_MS));
     this.timers.push(setInterval(() => this.probeLatency(), 5_000));
     this.timers.push(setInterval(() => void this.verifyNext(), 5_000));
+    this.timers.push(setInterval(() => void this.carry.tick(), 5_000));
     this.probeLatency();
   }
 
   stop() {
     this.stopStreams();
     for (const timer of this.timers) clearInterval(timer);
-    if (this.scanTimer) clearTimeout(this.scanTimer);
     this.saveSession();
+    this.carry.save();
   }
 
   setRunning(running: boolean) { this.running = running; }
@@ -179,6 +193,7 @@ export class Engine {
     this.hour = this.emptyHour();
     this.hours = [];
     this.saveSession();
+    this.carry.reset();
   }
 
   get summary() { return { coins: this.coverage.coins.length, markets: this.markets.length, source: this.coverage.source, errors: this.coverage.errors }; }
@@ -195,7 +210,7 @@ export class Engine {
     if (listing) {
       const selection = selectMarkets(listing, {
         tradableVenues: this.config.venues.filter((venue) => !INDICATIVE.includes(venue)), topCoins: this.config.topCoins,
-        include: this.config.extraCoins, exclude: this.config.excludeCoins, triangular: this.config.triangular,
+        include: [...this.config.extraCoins, ...(this.config.carry.enabled ? this.carry.coins : [])], exclude: this.config.excludeCoins, triangular: this.config.triangular,
         maxPerVenue: MAX_BOOKS_PER_VENUE,
       });
       this.markets = selection.markets.filter((market) => this.config.venues.includes(market.venue));
@@ -204,6 +219,7 @@ export class Engine {
       this.markets = this.config.venues.flatMap((venue) => symbols.filter((symbol) => supportedPair(symbol, venue)).map((symbol) => usdMarket(symbol, venue)));
       this.coverage = { coins: [...symbols], markets: this.markets.length, fetchedAt: 0, source: "built-in", errors: ["Exchange listings unavailable; using the built-in USD coins"] };
     }
+    this.index = indexRoutes(this.markets);
   }
 
   private async refreshMarkets() {
@@ -222,8 +238,8 @@ export class Engine {
       const stats = this.venueStats.get(market.venue);
       if (stats) { stats.streamQuotes++; stats.lastStreamAt = stats.lastQuoteAt = quote.receivedAt; }
       this.hour.quotes++;
-      // Depth changes below the best level re-send the same top of book; only a new top needs a rescan.
-      if (!previous || previous.bid !== quote.bid || previous.ask !== quote.ask || previous.bidSize !== quote.bidSize || previous.askSize !== quote.askSize) this.queueScan();
+      // Depth changes below the best level re-send the same top of book; only a new top needs a check.
+      if (!previous || previous.bid !== quote.bid || previous.ask !== quote.ask || previous.bidSize !== quote.bidSize || previous.askSize !== quote.askSize) this.react(market);
     }, (market) => { this.streamedAt.delete(keyOf(market)); });
   }
 
@@ -240,6 +256,7 @@ export class Engine {
     const stats = this.venueStats.get(market.venue);
     if (stats) { stats.restQuotes++; stats.lastQuoteAt = quote.receivedAt; }
     this.hour.quotes++;
+    if (!current || current.bid !== quote.bid || current.ask !== quote.ask || current.bidSize !== quote.bidSize || current.askSize !== quote.askSize) this.react(market);
   }
 
   // Venues with an all-markets endpoint are refreshed in one request; the rest spend a per-venue
@@ -257,7 +274,6 @@ export class Engine {
         this.lastBatchAt.set(venue, now);
         void fetchBatchBooks(venue, due).then((books) => {
           for (const market of due) { const quote = books.get(keyOf(market)); if (quote) this.storePolled(market, quote); }
-          if (books.size) this.queueScan();
         }).catch(() => { this.venueStats.get(venue)!.restErrors++; }).finally(() => this.inFlight.delete(venue));
         continue;
       }
@@ -276,25 +292,35 @@ export class Engine {
       const market = next, key = keyOf(market);
       this.tokens.set(venue, tokens - 1);
       this.inFlight.add(key);
-      void fetchMarketBook(market).then((quote) => { this.storePolled(market, quote); this.queueScan(); })
+      void fetchMarketBook(market).then((quote) => this.storePolled(market, quote))
         .catch(() => { this.venueStats.get(venue)!.restErrors++; this.unavailableUntil.set(key, Date.now() + REST_BACKOFF_MS); })
         .finally(() => this.inFlight.delete(key));
     }
   }
 
-  private queueScan() {
-    if (this.scanTimer) return;
-    const delay = Math.max(0, SCAN_SPACING_MS - (Date.now() - this.lastScanAt));
-    this.scanTimer = setTimeout(() => { this.scanTimer = undefined; this.scan(); }, delay);
+  // Re-checks only the routes that use the book that just changed, and paper-trades at once if one qualifies.
+  private react(market: Market) {
+    if (!this.ready || !this.running || !this.config.reactToPrices) return;
+    const started = performance.now(), now = Date.now();
+    const { settings } = this.config;
+    const found = scanMarket({
+      markets: this.markets, index: this.index, quotes: this.quotes, settings, conversionFee: this.config.conversionFee,
+      balance: this.session.balance, now, triangular: this.config.triangular,
+    }, market);
+    const tradable = found.filter((o) => !o.suspect && !o.venues.some((venue) => INDICATIVE.includes(venue)));
+    const chosen = chooseTrade(tradable, this.memory, { minNet: settings.minNet, now, cooldownMs: ROUTE_COOLDOWN_MS });
+    const decisionMs = performance.now() - started;
+    this.reactionMs.push(decisionMs);
+    if (this.reactionMs.length > REACTION_SAMPLES) this.reactionMs.shift();
+    if (chosen) { this.eventTrades++; this.executeTrade(chosen, now, decisionMs); }
   }
 
   private scan() {
     if (!this.ready) return;
-    const now = Date.now();
-    this.lastScanAt = now;
+    const now = Date.now(), started = performance.now();
     const { settings } = this.config;
     const result = scanOpportunities({
-      markets: this.markets, quotes: this.quotes, settings, conversionFee: this.config.conversionFee,
+      markets: this.markets, index: this.index, quotes: this.quotes, settings, conversionFee: this.config.conversionFee,
       balance: this.session.balance, now, triangular: this.config.triangular,
     });
     this.hour.scanMs += Date.now() - now;
@@ -325,9 +351,14 @@ export class Engine {
     if (!this.running) { explain(null); return; }
     this.session.scans++;
     this.hour.scans++;
+    // Most trades happen in react(); a full scan still catches routes that opened up without a price change
+    // on their own books, e.g. when a cooldown ends or a stablecoin's rate moves.
     const chosen = chooseTrade(tradable, this.memory, rules);
     explain(chosen);
-    if (!chosen) return;
+    if (chosen) this.executeTrade(chosen, now, performance.now() - started);
+  }
+
+  private executeTrade(chosen: Opportunity, now: number, decisionMs: number) {
     const trade: TradeRecord = { ...chosen, time: now };
     this.session.balance += trade.net;
     this.session.tradeCount++;
@@ -336,13 +367,24 @@ export class Engine {
     this.tradeLog.unshift({ time: now, kind: trade.kind, path: trade.path, notional: trade.notional, grossPct: trade.grossPct, net: trade.net, netPct: trade.netPct });
     this.tradeLog.length = Math.min(this.tradeLog.length, 50);
     this.store.appendTrade(trade);
-    this.replayShadow(chosen, now);
+    this.replayShadow(chosen, now, decisionMs);
     if (chosen.kind === "cross") {
       this.tradedRoutes.delete(chosen.key);
       this.tradedRoutes.set(chosen.key, chosen);
       if (this.tradedRoutes.size > TRADED_ROUTES_KEPT) this.tradedRoutes.delete(this.tradedRoutes.keys().next().value!);
     }
-    console.log(`${new Date(now).toLocaleTimeString()}  PAPER TRADE  ${trade.path}  net ${trade.net >= 0 ? "+" : ""}$${trade.net.toFixed(2)} (${trade.netPct.toFixed(2)}%)  balance $${this.session.balance.toFixed(2)}`);
+    console.log(`${new Date(now).toLocaleTimeString()}  PAPER TRADE  ${trade.path}  net ${trade.net >= 0 ? "+" : ""}$${trade.net.toFixed(2)} (${trade.netPct.toFixed(2)}%)  balance $${this.session.balance.toFixed(2)}  decided in ${decisionMs.toFixed(2)} ms`);
+  }
+
+  // Live USD books for a coin on every tradable exchange, with that exchange's taker fee, for the carry's spot leg.
+  private spotSides(coin: string): SpotSide[] {
+    const now = Date.now();
+    return this.markets.filter((m) => m.base === coin && m.quote === "USD" && !INDICATIVE.includes(m.venue)).flatMap((m) => {
+      const q = this.quotes.get(keyOf(m));
+      return q && now - q.receivedAt <= QUOTE_TTL_MS
+        ? [{ venue: m.venue, bid: q.bid, ask: q.ask, bidSize: q.bidSize, askSize: q.askSize, fee: (this.config.settings[feeKey[m.venue]] as number) / 100, at: q.receivedAt }]
+        : [];
+    });
   }
 
   private trackVenues() {
@@ -357,13 +399,15 @@ export class Engine {
   // Applies settings from the dashboard: trading settings take effect on the next scan, coin or exchange
   // changes reload the markets, and the rest (port, browser, keep-awake) on the next start.
   updateConfig(patch: Record<string, unknown>) {
-    const submitted = { ...this.config, ...patch, settings: { ...this.config.settings, ...(patch.settings as object || {}) } };
+    const submitted = { ...this.config, ...patch, settings: { ...this.config.settings, ...(patch.settings as object || {}) },
+      carry: { ...this.config.carry, ...(patch.carry as object || {}) } };
     const next = normalizeConfig(submitted);
     const adjusted = Object.entries(submitted.settings).filter(([key, value]) => next.settings[key as keyof typeof next.settings] !== value).map(([key]) => key);
+    for (const [key, value] of Object.entries(submitted.carry)) if (next.carry[key as keyof typeof next.carry] !== value) adjusted.push(`carry ${key}`);
     for (const key of ["startingBalance", "topCoins", "conversionFee"] as const) if (submitted[key] !== next[key]) adjusted.push(key);
     const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
     const marketsChanged = !same(next.venues, this.config.venues) || next.topCoins !== this.config.topCoins || next.triangular !== this.config.triangular ||
-      !same(next.extraCoins, this.config.extraCoins) || !same(next.excludeCoins, this.config.excludeCoins);
+      !same(next.extraCoins, this.config.extraCoins) || !same(next.excludeCoins, this.config.excludeCoins) || next.carry.enabled !== this.config.carry.enabled;
     const onRestart = (["port", "openBrowser", "keepAwake"] as const).filter((key) => next[key] !== this.config[key]);
     this.config = next;
     this.store.saveConfig(next);
@@ -494,9 +538,9 @@ export class Engine {
 
   // Replays a paper trade as the real orders would have landed: each leg is checked against its book one
   // round trip (plus decision time) after the decision, and anything left over is unwound one round trip later.
-  private replayShadow(trade: Opportunity, decidedAt: number) {
+  private replayShadow(trade: Opportunity, decidedAt: number, decisionMs: number) {
     const fills: LegFill[] = new Array(trade.legs.length);
-    const delays = trade.legs.map((leg) => this.latency.get(leg.venue) + DECISION_MS);
+    const delays = trade.legs.map((leg) => this.latency.get(leg.venue) + decisionMs + ORDER_PREP_MS);
     let pending = trade.legs.length;
     trade.legs.forEach((leg, index) => {
       setTimeout(() => {
@@ -550,7 +594,11 @@ export class Engine {
       rates: this.rates, feeds,
       routes: this.top.slice(0, 15).map((o) => ({ ...o, reason: this.reasons.get(o.key) ?? null })),
       suspectRoutes: this.suspects.map((o) => ({ ...o, since: this.suspectSeen.get(o.key)?.first ?? now, verdict: this.verdicts.get(o.key) ?? null })),
-      currentHour: this.hourRow(), trades: this.tradeLog, hours: this.hours,
+      currentHour: this.hourRow(), trades: this.tradeLog, hours: this.hours, carry: this.carry.snapshot(now),
+      reaction: (() => {
+        const sorted = [...this.reactionMs].sort((a, b) => a - b);
+        return { samples: sorted.length, medianMs: sorted[sorted.length >> 1] ?? null, p95Ms: sorted[Math.floor(sorted.length * 0.95)] ?? null, eventTrades: this.eventTrades };
+      })(),
       shadow: {
         since: ses.shadowSince, balance: ses.startingBalance + ses.shadow.realized, pnl: ses.shadow.realized,
         filled: ses.shadow.filled, partial: ses.shadow.partial, missed: ses.shadow.missed, recent: this.shadowLog,

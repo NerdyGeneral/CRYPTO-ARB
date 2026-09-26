@@ -36,11 +36,14 @@ The web page only scans while it is open and visible. `ArbiterPaper.exe` runs th
 
 Every estimate includes each exchange's entry-tier taker fee, conversion costs and the price-movement buffer on every leg, sized to the top of each order book. A paper trade never fills twice against the same unchanged quote, because a real fill would have used that liquidity up. The *Status* column under **Current best routes** says why each route was or wasn't traded: below your minimum profit, loses money after costs, quote already used, traded in the last minute, or next in line (one trade per scan).
 
+**Reaction speed.** Each time a book's best price or size changes, the engine re-checks only the routes that use that book (a route index is built when markets load) and paper-trades at once if one qualifies; the dashboard shows the measured time from price change to decision, typically well under a millisecond. Every route is also rescanned twice a second for the dashboard and for stablecoin rate changes. The realistic replay uses the measured decision time plus 5 ms to prepare orders. *React to each price change instantly* on the Settings tab turns the per-change checks off, leaving only the half-second scan, so the two can be compared on the Accuracy tab.
+
 **Dashboard tabs:**
 
 - *Overview* — balances, current routes with their status, suspect gaps with their verdicts, and each exchange's feed and measured latency.
 - *Paper trades* — the reality check for every trade, the trade log and the hourly summary.
 - *Accuracy* — how far the paper numbers are from reality (below), with charts by hour.
+- *Funding* — the spot vs futures carry (below): Coinbase's US perpetual futures, their funding rates, and a separate paper account holding carry positions.
 - *Settings* — every option in a form. Budget, minimum profit, fees, buffer and max gap apply on the next scan; coin and exchange changes reload the markets; start with Windows applies immediately; port, browser and keep-awake apply on the next start; starting balance applies from the next session reset. *Load defaults* fills in the defaults for you to review before saving.
 
 **Realistic results (shadow mode).** Paper trades assume every quote is still there when the order arrives. Shadow mode replays each paper trade as real immediate-or-cancel orders would have landed: each exchange's round trip is measured continuously from your PC, and each leg is checked against that exchange's order book one round trip after the decision. A leg fills only if its price (or better) is still on the book, up to the size shown. The trade is marked *filled*, *one side only* (the other side is sold or bought back at the next prices, fees included) or *missed*. Realistic P&L is what those replays would have made.
@@ -65,11 +68,22 @@ When a check finds different tokens, closed transfers or an outlier price, that 
 
 Click a suspect for the individual checks, or *Check now* to re-run them. CoinGecko's free API allows only a few requests a minute, so the first checks take a few minutes after start.
 
+**Funding carry (spot vs futures).** Buy a coin and short the same amount of its perpetual future: price moves cancel out, and while the future trades above spot, the short collects the funding that longs pay. The futures are Coinbase Financial Markets' US perpetual-style contracts (CFTC-regulated, open to US residents), read from Coinbase's public API; funding accrues every hour at roughly the hour's average futures premium over spot divided by 24.
+
+- Each hourly settlement is recorded in `funding.csv` and paid to open positions (contracts × contract size × index price × rate). Hours that settle while the engine is stopped can't be recovered from public data, so they aren't counted; the log notes them.
+- The coin is bought on whichever followed exchange is cheapest after its fee, and sold there on exit. Positions are whole contracts (for example 0.01 BTC or 0.1 ETH each), so each needs its coins plus collateral: 100% of the short by default, which means no leverage and, for BTC, room for a 50%+ rise before a margin call. Coins whose overnight margin needs more than 80% of the collateral setting are skipped.
+- A position opens once a contract has 6 hours of recorded funding and its expected return clears your minimum. Expected funding is the lower of the last 24 hours' average and the latest hour (only settled rates are used: Coinbase computes funding from its own futures and spot marks, which public prices don't reproduce); the return is after both legs' fees and spreads, in and out, spread over your expected holding time, and is measured on the capital tied up (coins plus collateral).
+- It closes when the last 6 hours of funding average below your exit rate, or before the futures price can rise within 10% of a margin call. Closing sells the coins at the bid and buys the short back at the ask, fees included.
+- Dated monthly futures are shown for comparison: shorting one and holding the coin to expiry locks in the gap. They aren't paper-traded yet.
+- Settings (Funding carry section): capital, positions at once, collateral %, futures fee (Coinbase lists 0.03% taker plus exchange fees; the default is 0.05%), minimum and exit returns, and expected holding time.
+
 **Results** are saved in an `arbiter-data` folder next to the exe:
 
 - `trades.csv` — every paper trade, with its route, size, costs and legs
 - `shadow.csv` — every replay: paper and realistic profit, outcome, how much filled, latency and anything unwound
 - `verdicts.csv` — every suspect and traded-route check
+- `carry.csv` — every carry open, hourly funding payment and close; `carry.json` holds the carry account
+- `funding.csv` — every hourly funding rate seen for each US perpetual (kept across session resets)
 - `hourly.csv` — one summary row per hour: trades, paper and realistic P&L, estimate error, replay outcomes, best cross-exchange and triangle net, suspect gaps
 - `session.json` — balances and counters
 - `listings.json` — the last exchange listings
