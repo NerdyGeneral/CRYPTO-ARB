@@ -111,6 +111,7 @@
     <a href="#overview" data-tab="overview">Overview</a>
     <a href="#trades" data-tab="trades">Paper trades</a>
     <a href="#accuracy" data-tab="accuracy">Accuracy</a>
+    <a href="#funding" data-tab="funding">Funding</a>
     <a href="#settings" data-tab="settings">Settings</a>
   </nav>
 
@@ -214,6 +215,41 @@
     </section>
   </div>
 
+  <div class="tab" id="tab-funding">
+    <p class="note" id="carryNote">Paper only. Buy a coin on the cheapest exchange and short the same amount of its US perpetual future on Coinbase (Coinbase Financial Markets, CFTC-regulated). Price moves cancel out; while the future trades above spot, the short collects the hourly funding that longs pay.</p>
+    <div class="stats">
+      <div class="stat"><small>Carry account</small><strong id="cEquity">—</strong><span id="cCapital">&nbsp;</span></div>
+      <div class="stat"><small>Carry P&amp;L</small><strong id="cPnl">—</strong><span id="cApr">&nbsp;</span></div>
+      <div class="stat"><small>Funding collected</small><strong id="cFunding">—</strong><span>all positions</span></div>
+      <div class="stat"><small>Fees paid</small><strong id="cFees">—</strong><span>both legs, in and out</span></div>
+      <div class="stat"><small>Open positions</small><strong id="cOpen">—</strong><span id="cCash">&nbsp;</span></div>
+    </div>
+
+    <section>
+      <h2>Open positions</h2>
+      <p class="sub">Coins held on the spot exchange, short futures on Coinbase. "Net if closed now" sells the coins at the bid and buys the short back at the ask, fees included. Margin shows how far the futures price can rise before the short's collateral falls below the overnight margin; positions close automatically before 10%.</p>
+      <div class="scroll"><table><thead><tr><th>Coin</th><th>Size</th><th class="num">Held</th><th class="num">Funding</th><th class="num">Price legs</th><th class="num">Fees</th><th class="num">Net if closed now</th><th class="num">Room to margin call</th></tr></thead><tbody id="cPositions"></tbody></table></div>
+    </section>
+
+    <section>
+      <h2>Perpetual futures</h2>
+      <p class="sub" id="cPerpNote">Funding rates as yearly rates. "Last hour" is the latest settlement, "24h avg" the average of those recorded here; the lower of the two is what an entry expects. Net return is on the capital a position ties up (coins plus collateral), after both legs' fees and spreads spread over your expected holding time.</p>
+      <div class="scroll"><table><thead><tr><th>Coin</th><th>Spot</th><th class="num">Futures bid</th><th class="num">Basis</th><th class="num">Last hour</th><th class="num">24h avg</th><th class="num">Net on capital</th><th class="num">Capital</th><th>Status</th></tr></thead><tbody id="cPerps"></tbody></table></div>
+    </section>
+
+    <section>
+      <h2>Dated futures (for comparison)</h2>
+      <p class="sub">Short the nearest monthly future and hold the coin to expiry: the gap is locked in at the start. Net is after fees and the spot spread; yearly return is on coins plus collateral. Not paper-traded yet.</p>
+      <div class="scroll"><table><thead><tr><th>Coin</th><th>Contract</th><th class="num">Days left</th><th class="num">Basis</th><th class="num">Net to expiry</th><th class="num">Yearly on capital</th><th>Spot</th></tr></thead><tbody id="cDated"></tbody></table></div>
+    </section>
+
+    <section>
+      <h2>Activity</h2>
+      <p class="sub">Opens, hourly funding payments and closes, newest first. The full log is <code>carry.csv</code>; every hourly rate is saved to <code>funding.csv</code>.</p>
+      <div class="scroll"><table><thead><tr><th>Time</th><th>Event</th><th>Coin</th><th class="num">Rate</th><th class="num">Amount</th><th>Note</th></tr></thead><tbody id="cEvents"></tbody></table></div>
+    </section>
+  </div>
+
   <div class="tab" id="tab-settings">
     <form id="settingsForm" autocomplete="off">
       <fieldset>
@@ -242,6 +278,21 @@
           <label class="field">Always include<input type="text" name="extraCoins" placeholder="e.g. PEPE, BONK"><small>Comma-separated symbols.</small></label>
           <label class="field">Never include<input type="text" name="excludeCoins" placeholder="e.g. LIT"><small>Comma-separated symbols.</small></label>
           <label class="check"><input type="checkbox" name="triangular"> Triangle routes within each exchange</label>
+          <label class="check"><input type="checkbox" name="reactToPrices"> React to each price change instantly <span class="muted">(otherwise routes are checked twice a second)</span></label>
+        </div>
+      </fieldset>
+      <fieldset>
+        <legend>Funding carry (paper)</legend>
+        <p class="hint">A separate paper account for the spot vs futures trade on the Funding tab. Capital applies from the next session reset.</p>
+        <div class="fields">
+          <label class="check"><input type="checkbox" name="c.enabled"> Follow Coinbase's US perpetual futures and paper-trade the carry</label>
+          <label class="field">Carry capital (USD)<input type="number" name="c.capital" step="100"><small>Coins plus collateral across all positions.</small></label>
+          <label class="field">Most positions at once<input type="number" name="c.maxPositions" step="1"><small>Capital is shared evenly between them.</small></label>
+          <label class="field">Collateral (% of the short)<input type="number" name="c.marginBuffer" step="5"><small>100% means no leverage. Lower returns more but gets margin-called sooner.</small></label>
+          <label class="field">Futures taker fee (%)<input type="number" name="c.futuresFee" step="0.01"><small>Per side. Coinbase lists 0.03% plus exchange fees.</small></label>
+          <label class="field">Minimum net return (%/yr)<input type="number" name="c.minNetApr" step="0.5"><small>On the capital used, after all fees.</small></label>
+          <label class="field">Close below (%/yr)<input type="number" name="c.exitApr" step="0.5"><small>When the last 6 hours of funding average below this.</small></label>
+          <label class="field">Expected holding time (days)<input type="number" name="c.holdDays" step="1"><small>Round-trip fees are spread over this when judging an entry.</small></label>
         </div>
       </fieldset>
       <fieldset>
@@ -389,6 +440,52 @@
     if (activeTab === "accuracy") renderCharts(s);
   }
 
+  const apr = (x) => x === null || x === undefined ? "—" : (x >= 0 ? "+" : "−") + Math.abs(x * 100).toFixed(1) + "%";
+  const hoursText = (h) => h < 48 ? `${h.toFixed(1)} h` : `${(h / 24).toFixed(1)} d`;
+  function renderCarry(s) {
+    const c = s.carry, a = c.account;
+    $("cEquity").textContent = money(a.equity);
+    $("cCapital").textContent = `started with ${money(a.capital)}`;
+    $("cPnl").textContent = signed(a.pnl); $("cPnl").className = cls(a.pnl);
+    $("cApr").textContent = a.apr === null ? "yearly rate after a day" : `${apr(a.apr)} a year so far`;
+    $("cFunding").textContent = signed(a.funding); $("cFunding").className = cls(a.funding);
+    $("cFees").textContent = money(a.fees);
+    $("cOpen").textContent = `${c.positions.length} / ${c.config.maxPositions}`;
+    $("cCash").textContent = `${money(a.cash)} free`;
+    $("carryNote").innerHTML = !c.enabled ? "The funding carry is turned off in Settings." :
+      c.error ? `<span class="warn">Coinbase futures data unavailable: ${esc(c.error)}. Retrying.</span>` :
+      "Paper only. Buy a coin on the cheapest exchange and short the same amount of its US perpetual future on Coinbase (Coinbase Financial Markets, CFTC-regulated). Price moves cancel out; while the future trades above spot, the short collects the hourly funding that longs pay. " +
+      `Each position ties up the coins plus ${c.config.marginBuffer}% of the short as collateral.`;
+    rows("cPositions", c.positions, (p) => {
+      const m = p.mark;
+      return `<tr><td><strong>${esc(p.coin)}</strong><br><span class="muted">${esc(p.perpId)}</span></td>` +
+        `<td>${p.contracts} contract${p.contracts === 1 ? "" : "s"} short<br><span class="muted">${p.spotQty.toLocaleString("en-US", { maximumFractionDigits: 6 })} ${esc(p.coin)} on ${esc(p.spotVenue)}</span></td>` +
+        `<td class="num">${hoursText(p.hours)}<br><span class="muted">${p.fundingPayments} payment${p.fundingPayments === 1 ? "" : "s"}</span></td>` +
+        `<td class="num ${cls(p.funding)}">${signed(p.funding)}</td>` +
+        `<td class="num ${m ? cls(m.spotPnl + m.shortPnl) : "muted"}">${m ? signed(m.spotPnl + m.shortPnl) : "—"}</td>` +
+        `<td class="num muted">${money(p.fees + (m ? m.exitFees : 0), 2)}</td>` +
+        `<td class="num ${m ? cls(m.net) : "muted"}">${m ? signed(m.net) : "waiting for prices"}</td>` +
+        `<td class="num ${!m ? "muted" : m.riseToMarginCall < 0.25 ? "neg" : m.riseToMarginCall < 0.5 ? "warn" : "pos"}">${m ? "+" + (m.riseToMarginCall * 100).toFixed(0) + "%" : "—"}</td></tr>`;
+    }, 8, c.enabled ? "No carry positions yet. One opens when a contract's expected return clears your minimum, after at least 6 hours of funding history." : "Turned off.");
+    rows("cPerps", c.perps, (r) => {
+      const q = r.quote, net = q ? q.netAprOnCapital : null;
+      const status = r.reason === "Opened" || r.reason === "Position open" ? "pos" : r.reason && r.reason.startsWith("Below") ? "warn" : "muted";
+      return `<tr><td><strong>${esc(r.coin)}</strong></td><td>${r.spotVenue ? `${esc(r.spotVenue)}<br><span class="muted">${money(r.spotAsk, r.spotAsk < 1 ? 6 : 2)}</span>` : '<span class="muted">—</span>'}</td>` +
+        `<td class="num">${r.bid === null ? "—" : r.bid.toLocaleString("en-US", { maximumFractionDigits: 8 })}</td>` +
+        `<td class="num ${q ? cls(q.basisPct) : "muted"}">${q ? pct(q.basisPct) : "—"}</td>` +
+        `<td class="num ${cls(r.lastApr)}">${apr(r.lastApr)}</td><td class="num ${cls(r.trailingApr)}">${r.trailingApr === null ? `<span class="muted">${r.samples}/6 h</span>` : apr(r.trailingApr)}</td>` +
+        `<td class="num ${net === null ? "muted" : net >= c.config.minNetApr / 100 ? "pos" : net > 0 ? "warn" : "neg"}">${apr(net)}</td>` +
+        `<td class="num muted">${q && q.contracts ? money(q.capital, 0) : "—"}</td><td class="wrap ${status}">${esc(r.reason || "")}</td></tr>`;
+    }, 10, c.enabled ? (c.error ? "Coinbase futures data unavailable." : "Loading Coinbase's futures…") : "Turned off.");
+    rows("cDated", c.dated, (d) => `<tr><td><strong>${esc(d.coin)}</strong></td><td class="muted">${esc(d.id)}</td><td class="num">${d.days.toFixed(0)}</td>` +
+      `<td class="num ${d.basisPct === null ? "muted" : cls(d.basisPct)}">${d.basisPct === null ? "—" : pct(d.basisPct)}</td>` +
+      `<td class="num ${d.netPct === null ? "muted" : cls(d.netPct)}">${d.netPct === null ? "—" : pct(d.netPct)}</td>` +
+      `<td class="num ${d.netAprOnCapital === null ? "muted" : cls(d.netAprOnCapital)}">${apr(d.netAprOnCapital)}</td><td class="muted">${esc(d.spotVenue || "—")}</td></tr>`, 7,
+      c.enabled ? "Loading…" : "Turned off.");
+    rows("cEvents", c.events, (e) => `<tr><td class="muted">${when(Date.parse(e.time))}</td><td>${esc(e.event)}</td><td>${esc(e.coin)}</td>` +
+      `<td class="num">${e.funding_rate ? apr(Number(e.funding_rate) * 8760) : ""}</td><td class="num ${cls(Number(e.amount_usd))}">${e.amount_usd ? signed(Number(e.amount_usd)) : ""}</td><td class="muted">${esc(e.note || "")}</td></tr>`, 6, "Nothing yet.");
+  }
+
   function verdictBar(counts) {
     const total = verdictNames.reduce((n, [k]) => n + counts[k], 0);
     if (!total) return `<div class="vbar none">Nothing checked yet</div>`;
@@ -496,10 +593,12 @@
     $("coverage").innerHTML = !s.ready ? "Finding markets on each exchange…" :
       `<span><strong>${cov.coins}</strong> coins</span><span><strong>${cov.markets.toLocaleString()}</strong> order books</span>` +
       `<span><strong>${s.feeds.length}</strong> exchanges</span><span>${rate("USDT")} · ${rate("USDC")}</span>` +
+      (s.reaction.medianMs === null ? "" : `<span title="Time from a price change arriving to a trade decision, over the last ${s.reaction.samples} changes">Reacts in <strong>${s.reaction.medianMs < 0.1 ? "<0.1" : s.reaction.medianMs.toFixed(1)} ms</strong> (95% within ${s.reaction.p95Ms.toFixed(1)} ms)</span>`) +
       (cov.source !== "live" ? `<span class="warn">Using ${cov.source === "cache" ? "saved" : "built-in"} listings</span>` : "");
     renderOverview(s);
     renderTrades(s);
     renderAccuracy(s);
+    renderCarry(s);
     $("footer").innerHTML = `Data folder: <code>${esc(s.dataDir)}</code> · Budget ${money(s.settings.budget)} per trade · minimum net ${money(s.settings.minNet)} · buffer ${s.settings.buffer}% per leg · stablecoin conversion ${s.conversionFee}%`;
   }
 
@@ -537,11 +636,13 @@
       const name = input.name;
       if (name === "venue") input.checked = config.venues.includes(input.value);
       else if (name.startsWith("s.")) input.value = config.settings[name.slice(2)];
+      else if (name.startsWith("c.")) { if (input.type === "checkbox") input.checked = !!config.carry[name.slice(2)]; else input.value = config.carry[name.slice(2)]; }
       else if (input.type === "checkbox") input.checked = !!config[name];
       else if (name === "extraCoins" || name === "excludeCoins") input.value = config[name].join(", ");
       else input.value = config[name];
     }
-    if (schema) for (const [key, [min, max]] of Object.entries(schema.ranges)) { const input = form.elements[`s.${key}`]; if (input) { input.min = min; input.max = max; } }
+    if (schema) for (const [prefix, ranges] of [["s.", schema.ranges], ["c.", schema.carryRanges || {}]])
+      for (const [key, [min, max]] of Object.entries(ranges)) { const input = form.elements[`${prefix}${key}`]; if (input) { input.min = min; input.max = max; } }
   }
   async function loadSettings(force) {
     if (loadedSettings && !force) return;
@@ -553,11 +654,12 @@
   $("loadDefaults").onclick = () => { if (schema) { fill({ ...schema.defaults, port: schema.config.port }); $("saveResult").textContent = "Defaults loaded. Save to apply them."; $("saveResult").className = "muted"; } };
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
-    const patch = { settings: {} };
+    const patch = { settings: {}, carry: {} };
     for (const input of form.querySelectorAll("input")) {
       const name = input.name;
       if (name === "venue") continue;
       if (name.startsWith("s.")) patch.settings[name.slice(2)] = Number(input.value);
+      else if (name.startsWith("c.")) patch.carry[name.slice(2)] = input.type === "checkbox" ? input.checked : Number(input.value);
       else if (input.type === "checkbox") patch[name] = input.checked;
       else if (name === "extraCoins" || name === "excludeCoins") patch[name] = input.value.split(/[\s,]+/).filter(Boolean);
       else patch[name] = Number(input.value);

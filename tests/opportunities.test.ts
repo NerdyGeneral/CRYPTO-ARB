@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { defaults, emptyMarkets, routesFor, type Quote, type Settings } from "../lib/market";
 import { keyOf, makeMarket, type Market } from "../lib/markets";
 import { selectMarkets } from "../lib/discovery";
-import { barrierKey, blockReason, chooseTrade, scanOpportunities, type Opportunity } from "../lib/opportunities";
+import { barrierKey, blockReason, chooseTrade, indexRoutes, scanMarket, scanOpportunities, type Opportunity } from "../lib/opportunities";
 
 const now = 1_000_000;
 const quote = (bid: number, ask: number, size = 1000, receivedAt = now - 100): Quote => ({ bid, bidSize: size, ask, askSize: size, receivedAt, source: "stream" });
@@ -142,4 +142,36 @@ test("market selection ranks coins by volume, needs two venues and caps books pe
   assert.ok(selection.markets.some((m) => m.base === "USDT" && m.quote === "USD"));
   assert.ok(selection.markets.some((m) => m.base === "ETH" && m.quote === "BTC"));
   assert.ok(!selection.markets.some((m) => m.base === "LONE" || m.base === "AAA"));
+});
+
+test("re-checking only the routes that use a changed book finds exactly what a full scan finds", () => {
+  // Three venues with USD, USDT and BTC books for a few coins, and seeded random prices around a reference.
+  let seed = 7;
+  const random = () => { seed = (seed * 16807) % 2147483647; return seed / 2147483647; };
+  const reference: Record<string, number> = { BTC: 84000, ETH: 2700, SOL: 122, XRP: 1.57, USDT: 1, USD: 1 };
+  const entries: [Market, Quote][] = [];
+  for (const venue of ["Coinbase", "Kraken", "Binance.US"] as const) {
+    for (const [base, quoteCcy] of [["BTC", "USD"], ["ETH", "USD"], ["SOL", "USD"], ["XRP", "USD"], ["ETH", "BTC"], ["SOL", "BTC"], ["XRP", "USDT"], ["USDT", "USD"], ["SOL", "USDT"]]) {
+      const mid = reference[base] / reference[quoteCcy] * (1 + (random() - 0.5) * 0.03), half = mid * 0.0002;
+      entries.push([makeMarket(venue, base, quoteCcy), quote(mid - half, mid + half, 1 + random() * 50, now - Math.floor(random() * 2000))]);
+    }
+  }
+  const input = { ...book(entries), settings: { ...settings, maxGap: 50, budget: 1000 }, conversionFee: 0.2, balance: 5000, now, triangular: true };
+  const index = indexRoutes(input.markets);
+  const full = scanOpportunities({ ...input, index });
+  assert.ok(full.top.length >= 10, `expected a full list, got ${full.top.length}`);
+  assert.ok(full.top.some((o) => o.kind === "triangle") && full.top.some((o) => o.kind === "cross"), "both kinds of route are covered");
+  for (const o of full.top) {
+    // Each route the full scan found is found, with the same value, when any one of its books changes.
+    for (const leg of o.legs) {
+      const market = input.markets.find((m) => keyOf(m) === leg.market)!;
+      if (market.base === "USDT") continue; // stablecoin books are left to the full scan
+      const match = scanMarket({ ...input, index }, market).find((x) => x.key === o.key);
+      assert.ok(match, `${o.key} missing when ${leg.market} changes`);
+      close(match!.net, o.net);
+    }
+  }
+  // And nothing it returns involves only other books.
+  const market = input.markets.find((m) => keyOf(m) === "Kraken|SOL/BTC")!;
+  for (const o of scanMarket({ ...input, index }, market)) assert.ok(o.legs.some((leg) => leg.market === "Kraken|SOL/BTC"), o.key);
 });

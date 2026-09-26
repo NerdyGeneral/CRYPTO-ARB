@@ -79,6 +79,10 @@ jobs:
           if (-not $helper) { throw "Keep-awake helper did not start" }
           if (@($state.feeds | Where-Object { $_.latencyMeasured }).Count -lt 5) { throw "Exchange latency was not measured" }
           if ($null -eq $state.shadow -or $null -eq $state.accuracy) { throw "Shadow and accuracy figures are missing" }
+          Write-Host "Carry: $(@($state.carry.perps).Count) US perps, $(@($state.carry.dated).Count) dated futures, error: $($state.carry.error); reaction median $($state.reaction.medianMs) ms over $($state.reaction.samples) price changes"
+          if (@($state.carry.perps).Count -lt 10) { throw "Coinbase's US perpetual futures were not loaded" }
+          if (@($state.carry.perps | Where-Object { $_.bid -and $_.spotVenue }).Count -lt 10) { throw "Carry legs are missing prices" }
+          if ($state.reaction.samples -lt 100) { throw "The engine is not reacting to price changes" }
           if ($saved.config.settings.minNet -ne 0.3) { throw "Settings were not saved through the dashboard API" }
           if ($refused.StatusCode -ne 404) { throw "A settings change without the dashboard header was accepted" }
           Write-Host "Startup shortcut target: $linkTarget"
