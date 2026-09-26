@@ -76,11 +76,12 @@ export class LatencyTracker {
     if (list.length > this.keep) list.shift();
     this.samples.set(venue, list);
   }
-  get(venue: string) {
+  get(venue: string) { return this.percentile(venue, 0.5); }
+  percentile(venue: string, p: number) {
     const list = this.samples.get(venue);
     if (!list?.length) return this.fallbackMs;
     const sorted = [...list].sort((a, b) => a - b);
-    return sorted[Math.floor(sorted.length / 2)];
+    return sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * p))];
   }
   measured(venue: string) { return (this.samples.get(venue)?.length || 0) > 0; }
 }

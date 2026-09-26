@@ -1,14 +1,19 @@
+import crypto from "node:crypto";
 import { accuracy, addReplay, emptyTally, histogram, verdictKinds, verdictSummary, type VerdictGroup } from "../lib/accuracy";
+import type { SpotSide } from "../lib/carry";
 import { discover, selectMarkets, type Listing } from "../lib/discovery";
 import { batchVenues, fetchBatchBooks, fetchMarketBook } from "../lib/exchanges";
-import type { SpotSide } from "../lib/carry";
+import { sendInParallel } from "../lib/execution";
 import { feeKey, supportedPair, symbols, type Quote, type Venue } from "../lib/market";
 import { keyOf, usdMarket, type Market } from "../lib/markets";
 import { barrierKey, blockReason, chooseTrade, indexRoutes, scanMarket, scanOpportunities, type Opportunity, type Rate, type RouteIndex, type TradeMemory } from "../lib/opportunities";
+import { checkLeg, coinbaseCreateOrder, krakenAddOrder } from "../lib/orders";
 import { fillLeg, LatencyTracker, settle, type LegFill } from "../lib/shadow";
+import { coinbaseJwt, krakenSignature } from "../lib/signing";
 import { connectStreams } from "../lib/streams";
 import { judge, tokenMap, transferStatus, type TokenMap, type Transfer, type Verdict, type VerdictKind } from "../lib/verify";
 import { Carry } from "./carry";
+import { Connections } from "./connections";
 import { normalizeConfig, Store, type EngineConfig, type HourlyRow, type SessionFile, type ShadowRecord, type TradeRecord } from "./store";
 
 // A quote counts as streamed while its feed has updated within this window; otherwise REST fills in.
@@ -22,11 +27,10 @@ const ROUTE_COOLDOWN_MS = 60_000;
 const FULL_SCAN_MS = 500;
 const REDISCOVER_MS = 12 * 60 * 60 * 1000;
 const QUOTE_TTL_MS = 12_000;
-// Shadow mode: time to prepare and send orders once a trade is chosen (added to the measured decision time),
-// and how often to re-measure each venue's round trip.
-const ORDER_PREP_MS = 5;
+// Shadow mode: how often to re-measure each venue's round trip (the time to prepare orders is measured at start).
 const REACTION_SAMPLES = 1000;
-const LATENCY_PROBE_MS = 30_000;
+// Often enough that each exchange's connection never sits idle long enough to be closed.
+const LATENCY_PROBE_MS = 15_000;
 // Route verification: one route at a time, spaced for CoinGecko's keyless limit, results kept for hours.
 // Suspect gaps are checked first, then routes that were paper-traded, to measure the max-gap rule both ways.
 const VERIFY_SPACING_MS = 20_000;
@@ -43,13 +47,13 @@ const COINGECKO_SPACING_MS = 6_500;
 const COINGECKO_BACKOFF_MS = 60_000;
 const probeHeaders = { Accept: "application/json", "User-Agent": "arbiter-live/0.1" };
 // Lightweight public requests used to time a round trip to each exchange's API.
-const probes: Record<Venue, { url: string; init?: RequestInit; everyMs?: number }> = {
+const probes: Record<Venue, { url: string; init?: { method: string; body: string; headers: Record<string, string> }; everyMs?: number }> = {
   Coinbase: { url: "https://api.exchange.coinbase.com/time" },
   Kraken: { url: "https://api.kraken.com/0/public/Time" },
   Gemini: { url: "https://api.gemini.com/v2/ticker/btcusd" },
   Bitstamp: { url: "https://www.bitstamp.net/api/v2/ticker/btcusd/" },
   // CEX.IO counts every request against ~100 a minute, so it is timed less often.
-  "CEX.IO": { url: "https://trade.cex.io/api/spot/rest-public/get_server_time", init: { method: "POST", body: "{}", headers: { ...probeHeaders, "Content-Type": "application/json" } }, everyMs: 60_000 },
+  "CEX.IO": { url: "https://trade.cex.io/api/spot/rest-public/get_server_time", init: { method: "POST", body: "{}", headers: { "Content-Type": "application/json" } }, everyMs: 60_000 },
   "Binance.US": { url: "https://api.binance.us/api/v3/ping" },
   bitFlyer: { url: "https://api.bitflyer.com/v1/gethealth" },
   "OKX US": { url: "https://us.okx.com/api/v5/public/time" },
@@ -90,9 +94,13 @@ export class Engine {
   private readonly tradeLog: LoggedTrade[];
   private readonly shadowLog: LoggedShadow[];
   private readonly shadowErrors: number[];
-  private readonly latency = new LatencyTracker(300, 15);
+  private readonly latency = new LatencyTracker(300, 40);
   private readonly probedAt = new Map<Venue, number>();
-  private readonly warmed = new Set<Venue>();
+  private readonly connections = new Connections();
+  private readonly reconnects = new Map<Venue, number>();
+  private marketByKey = new Map<string, Market>();
+  // Time to build and sign one order, measured at start; added to the decision time in the replay.
+  private readonly orderPrepMs = measureOrderPrep();
   private readonly suspectSeen = new Map<string, { first: number; last: number }>();
   private readonly verdicts = new Map<string, Verdict>();
   // Latest verdict per route and group ("suspect" or "traded"), for the accuracy figures and re-check timing.
@@ -173,6 +181,7 @@ export class Engine {
   stop() {
     this.stopStreams();
     for (const timer of this.timers) clearInterval(timer);
+    this.connections.close();
     this.saveSession();
     this.carry.save();
   }
@@ -220,6 +229,7 @@ export class Engine {
       this.coverage = { coins: [...symbols], markets: this.markets.length, fetchedAt: 0, source: "built-in", errors: ["Exchange listings unavailable; using the built-in USD coins"] };
     }
     this.index = indexRoutes(this.markets);
+    this.marketByKey = new Map(this.markets.map((m) => [keyOf(m), m]));
   }
 
   private async refreshMarkets() {
@@ -307,7 +317,7 @@ export class Engine {
       markets: this.markets, index: this.index, quotes: this.quotes, settings, conversionFee: this.config.conversionFee,
       balance: this.session.balance, now, triangular: this.config.triangular,
     }, market);
-    const tradable = found.filter((o) => !o.suspect && !o.venues.some((venue) => INDICATIVE.includes(venue)));
+    const tradable = found.filter((o) => !o.suspect && !o.venues.some((venue) => INDICATIVE.includes(venue)) && !this.orderProblem(o));
     const chosen = chooseTrade(tradable, this.memory, { minNet: settings.minNet, now, cooldownMs: ROUTE_COOLDOWN_MS });
     const decisionMs = performance.now() - started;
     this.reactionMs.push(decisionMs);
@@ -329,6 +339,7 @@ export class Engine {
     this.suspects = result.suspects;
     this.rates = result.rates;
     const tradable = result.top.filter((o) => !o.venues.some((venue) => INDICATIVE.includes(venue)));
+    const sendable = tradable.filter((o) => !this.orderProblem(o));
     for (const o of tradable) {
       const field = o.kind === "triangle" ? "bestTriangleNetPct" : "bestNetPct";
       if (this.hour[field] === null || o.netPct > this.hour[field]!) this.hour[field] = o.netPct;
@@ -346,14 +357,14 @@ export class Engine {
         o === traded ? "Paper-traded" :
         o.venues.some((venue) => INDICATIVE.includes(venue)) ? "Indicative prices only (Crypto.com)" :
         !this.running ? "Bot paused" :
-        blockReason(o, this.memory, rules) ?? "Next in line (one trade per scan)"]));
+        blockReason(o, this.memory, rules) ?? this.orderProblem(o) ?? "Next in line (one trade per scan)"]));
     };
     if (!this.running) { explain(null); return; }
     this.session.scans++;
     this.hour.scans++;
     // Most trades happen in react(); a full scan still catches routes that opened up without a price change
     // on their own books, e.g. when a cooldown ends or a stablecoin's rate moves.
-    const chosen = chooseTrade(tradable, this.memory, rules);
+    const chosen = chooseTrade(sendable, this.memory, rules);
     explain(chosen);
     if (chosen) this.executeTrade(chosen, now, performance.now() - started);
   }
@@ -509,8 +520,9 @@ export class Engine {
     return this.verifyNext(target);
   }
 
-  // Times a light request to each venue on a schedule; the first request per venue only opens the
-  // connection, so it is not counted.
+  // Times a light request to each venue over its kept-open connection. Only requests that reused an open
+  // connection count, so the figure is the round trip an order would see, not a handshake; a request that had
+  // to reconnect is retried at once to reopen it.
   private probeLatency() {
     const now = Date.now();
     for (const venue of this.config.venues) {
@@ -518,13 +530,11 @@ export class Engine {
       if (this.inFlight.has(`probe|${venue}`) || now - (this.probedAt.get(venue) || 0) < (probe.everyMs || LATENCY_PROBE_MS)) continue;
       this.probedAt.set(venue, now);
       this.inFlight.add(`probe|${venue}`);
-      const started = performance.now();
-      void fetch(probe.url, { headers: probeHeaders, cache: "no-store", signal: AbortSignal.timeout(5000), ...probe.init })
-        .then(async (response) => {
-          await response.text();
-          if (!response.ok) return;
-          if (this.warmed.has(venue)) this.latency.record(venue, performance.now() - started);
-          else { this.warmed.add(venue); this.probedAt.set(venue, 0); }
+      void this.connections.request(probe.url, probe.init)
+        .then((timed) => {
+          if (timed.status < 200 || timed.status >= 300) return;
+          if (timed.reused) this.latency.record(venue, timed.ms);
+          else { this.reconnects.set(venue, (this.reconnects.get(venue) || 0) + 1); this.probedAt.set(venue, 0); }
         })
         .catch(() => { /* A failed probe keeps the last measurement. */ })
         .finally(() => this.inFlight.delete(`probe|${venue}`));
@@ -538,17 +548,25 @@ export class Engine {
 
   // Replays a paper trade as the real orders would have landed: each leg is checked against its book one
   // round trip (plus decision time) after the decision, and anything left over is unwound one round trip later.
+  // A leg the exchange would reject, judged from its published order rules (Coinbase and Kraken).
+  private orderProblem(o: Opportunity): string | null {
+    for (const leg of o.legs) {
+      const problem = checkLeg(leg, this.marketByKey.get(leg.market)?.rules).problem;
+      if (problem) return problem;
+    }
+    return null;
+  }
+
+  // Replays the legs as sent together: each reaches its exchange one round trip (plus the decision and order
+  // preparation) later, and anything left unmatched is unwound one more round trip after that.
   private replayShadow(trade: Opportunity, decidedAt: number, decisionMs: number) {
-    const fills: LegFill[] = new Array(trade.legs.length);
-    const delays = trade.legs.map((leg) => this.latency.get(leg.venue) + decisionMs + ORDER_PREP_MS);
-    let pending = trade.legs.length;
-    trade.legs.forEach((leg, index) => {
-      setTimeout(() => {
-        fills[index] = fillLeg(leg, this.freshQuote(leg.market));
-        if (--pending) return;
+    const delays = trade.legs.map((leg) => this.latency.get(leg.venue) + decisionMs + this.orderPrepMs);
+    void sendInParallel(trade.legs, (leg, index) => new Promise<LegFill>((resolve) =>
+      setTimeout(() => resolve(fillLeg(leg, this.freshQuote(leg.market))), delays[index])))
+      .then((sent) => {
+        const fills = sent.map((s) => s.result ?? { leg: s.leg, filledQty: 0, price: null });
         setTimeout(() => this.finishShadow(trade, fills, decidedAt, Math.max(...delays)), Math.max(...trade.legs.map((l) => this.latency.get(l.venue))));
-      }, delays[index]);
-    });
+      });
   }
 
   private finishShadow(trade: Opportunity, fills: LegFill[], decidedAt: number, latencyMs: number) {
@@ -582,7 +600,8 @@ export class Engine {
         venue, live, markets: venueMarkets.length, streaming: now - stats.lastStreamAt < 15_000, indicative: INDICATIVE.includes(venue),
         lastQuoteAgoMs: stats.lastQuoteAt ? now - stats.lastQuoteAt : null,
         streamQuotes: stats.streamQuotes, restQuotes: stats.restQuotes, restErrors: stats.restErrors,
-        latencyMs: Math.round(this.latency.get(venue)), latencyMeasured: this.latency.measured(venue),
+        latencyMs: Math.round(this.latency.get(venue)), latencyP95Ms: Math.round(this.latency.percentile(venue, 0.95)),
+        latencyMeasured: this.latency.measured(venue), reconnects: this.reconnects.get(venue) || 0,
       };
     });
     const ses = this.session;
@@ -595,6 +614,7 @@ export class Engine {
       routes: this.top.slice(0, 15).map((o) => ({ ...o, reason: this.reasons.get(o.key) ?? null })),
       suspectRoutes: this.suspects.map((o) => ({ ...o, since: this.suspectSeen.get(o.key)?.first ?? now, verdict: this.verdicts.get(o.key) ?? null })),
       currentHour: this.hourRow(), trades: this.tradeLog, hours: this.hours, carry: this.carry.snapshot(now),
+      orderPrepMs: this.orderPrepMs,
       reaction: (() => {
         const sorted = [...this.reactionMs].sort((a, b) => a - b);
         return { samples: sorted.length, medianMs: sorted[sorted.length >> 1] ?? null, p95Ms: sorted[Math.floor(sorted.length * 0.95)] ?? null, eventTrades: this.eventTrades };
@@ -650,4 +670,25 @@ export class Engine {
     console.log(`${new Date().toLocaleTimeString()}  HOUR ${new Date(this.hour.start).toLocaleTimeString([], { hour: "numeric" })}  trades ${row.trades}  paper pnl $${row.pnl.toFixed(2)}  realistic pnl $${row.shadow.realized.toFixed(2)}  best cross ${pct(row.bestNetPct)}  best triangle ${pct(row.bestTriangleNetPct)}  suspect ${row.suspectRoutes}`);
     this.hour = this.emptyHour();
   }
+}
+
+// Builds and signs sample orders with throwaway keys (never real credentials) to time what preparing an order
+// costs on this PC: the median of Kraken's HMAC signature and Coinbase's ES256 JWT, each with its payload.
+function measureOrderPrep(): number {
+  const { privateKey } = crypto.generateKeyPairSync("ec", { namedCurve: "prime256v1" });
+  const pem = privateKey.export({ type: "sec1", format: "pem" }).toString();
+  const secret = crypto.randomBytes(64).toString("base64");
+  const leg = { venue: "Kraken" as Venue, pair: "BTC/USD", base: "BTC", quote: "USD", side: "buy" as const, price: 84000, market: "", size: 1, qty: 0.0006, fee: 0 };
+  const market = { venue: "Kraken" as Venue, base: "BTC", quote: "USD", rest: "BTC-USD", ws: "BTC/USD", rules: { lot: 1e-8, tick: 0.01, minQty: 0, minNotional: 0 } };
+  const samples: number[] = [];
+  for (let i = 0; i < 50; i++) {
+    const started = performance.now();
+    const kraken = JSON.stringify(krakenAddOrder(leg, market, { token: "sample", reqId: i }));
+    krakenSignature("/0/private/AddOrder", String(i), kraken, secret);
+    const coinbase = coinbaseCreateOrder(leg, market, `sample-${i}`);
+    coinbaseJwt({ keyName: "sample", privateKeyPem: pem, method: coinbase.method, host: coinbase.host, path: coinbase.path });
+    JSON.stringify(coinbase.body);
+    samples.push(performance.now() - started);
+  }
+  return samples.sort((a, b) => a - b)[25];
 }

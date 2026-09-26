@@ -139,7 +139,7 @@
 
     <section>
       <h2>Exchange feeds</h2>
-      <p class="sub">Live = order books with a quote under 12 seconds old. Latency is the measured round trip from this PC, used to replay trades realistically.</p>
+      <p class="sub">Live = order books with a quote under 12 seconds old. Latency is the round trip from this PC over a connection kept open to each exchange (median, and the time 95% of requests beat), used to replay trades realistically.</p>
       <div class="scroll"><table><thead><tr><th>Exchange</th><th class="num">Live books</th><th>Source</th><th class="num">Last quote</th><th class="num">Latency</th><th class="num">Poll errors</th></tr></thead><tbody id="feeds"></tbody></table></div>
     </section>
   </div>
@@ -389,7 +389,7 @@
 
     rows("feeds", s.feeds, (f) => `<tr><td>${esc(f.venue)}${f.indicative ? ' <span class="muted">(indicative)</span>' : ""}</td><td class="num ${f.live >= f.markets * 0.9 ? "pos" : f.live ? "warn" : "neg"}">${f.live}/${f.markets}</td>` +
       `<td>${f.streaming ? '<span class="pos">Streaming</span>' : f.restQuotes ? '<span class="warn">Polling</span>' : '<span class="neg">No data</span>'}</td>` +
-      `<td class="num muted">${ago(f.lastQuoteAgoMs)}</td><td class="num ${f.latencyMeasured ? "" : "muted"}">${f.latencyMeasured ? f.latencyMs + " ms" : "measuring"}</td><td class="num muted">${f.restErrors}</td></tr>`, 6, "Starting…");
+      `<td class="num muted">${ago(f.lastQuoteAgoMs)}</td><td class="num ${f.latencyMeasured ? "" : "muted"}" title="${f.latencyMeasured ? `Round trip over a kept-open connection: median ${f.latencyMs} ms, 95% within ${f.latencyP95Ms} ms; reconnected ${f.reconnects} times` : ""}">${f.latencyMeasured ? `${f.latencyMs} ms <span class="muted">· p95 ${f.latencyP95Ms}</span>` : "measuring"}</td><td class="num muted">${f.restErrors}</td></tr>`, 6, "Starting…");
   }
 
   function renderTrades(s) {
@@ -593,7 +593,7 @@
     $("coverage").innerHTML = !s.ready ? "Finding markets on each exchange…" :
       `<span><strong>${cov.coins}</strong> coins</span><span><strong>${cov.markets.toLocaleString()}</strong> order books</span>` +
       `<span><strong>${s.feeds.length}</strong> exchanges</span><span>${rate("USDT")} · ${rate("USDC")}</span>` +
-      (s.reaction.medianMs === null ? "" : `<span title="Time from a price change arriving to a trade decision, over the last ${s.reaction.samples} changes">Reacts in <strong>${s.reaction.medianMs < 0.1 ? "<0.1" : s.reaction.medianMs.toFixed(1)} ms</strong> (95% within ${s.reaction.p95Ms.toFixed(1)} ms)</span>`) +
+      (s.reaction.medianMs === null ? "" : `<span title="Time from a price change arriving to a trade decision, over the last ${s.reaction.samples} changes; then building and signing the orders">Reacts in <strong>${s.reaction.medianMs < 0.1 ? "<0.1" : s.reaction.medianMs.toFixed(1)} ms</strong> (95% within ${s.reaction.p95Ms.toFixed(1)} ms) · orders ready in ${s.orderPrepMs.toFixed(2)} ms</span>`) +
       (cov.source !== "live" ? `<span class="warn">Using ${cov.source === "cache" ? "saved" : "built-in"} listings</span>` : "");
     renderOverview(s);
     renderTrades(s);

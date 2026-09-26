@@ -1,5 +1,5 @@
 import type { Venue } from "./market";
-import { isDollarStable, keyOf, makeMarket, type Market } from "./markets";
+import { isDollarStable, keyOf, makeMarket, type Market, type OrderRules } from "./markets";
 
 // Finds what each exchange lists from its public endpoints, so the engine is not limited to a
 // hand-maintained coin list, and ranks coins by combined 24h dollar volume.
@@ -21,21 +21,27 @@ async function get<T>(url: string, init: RequestInit = {}): Promise<T> {
   return response.json() as Promise<T>;
 }
 const krakenAsset = (name: string) => ({ XBT: "BTC", XDG: "DOGE" })[name] || name;
+// Order rules from a listing, or none if any value is missing or malformed.
+const orderRules = (lot: number, tick: number, minQty: number, minNotional: number): OrderRules | undefined =>
+  [lot, tick].every((n) => Number.isFinite(n) && n > 0) ? { lot, tick, minQty: Number.isFinite(minQty) ? minQty : 0, minNotional: Number.isFinite(minNotional) ? minNotional : 0 } : undefined;
 
 async function listVenue(venue: Venue): Promise<Market[]> {
-  const pair = (base: string, quote: string, names?: Partial<Pick<Market, "rest" | "ws" | "batch">>) =>
+  const pair = (base: string, quote: string, names?: Partial<Pick<Market, "rest" | "ws" | "batch" | "rules">>) =>
     wanted.has(quote) && base !== quote ? [makeMarket(venue, base, quote, names)] : [];
   switch (venue) {
     case "Coinbase": {
-      const rows = await get<{ id: string; base_currency: string; quote_currency: string; status: string; trading_disabled: boolean; cancel_only: boolean; auction_mode: boolean }[]>("https://api.exchange.coinbase.com/products");
+      const rows = await get<{ id: string; base_currency: string; quote_currency: string; status: string; trading_disabled: boolean; cancel_only: boolean; auction_mode: boolean;
+        base_increment: string; quote_increment: string; min_market_funds: string }[]>("https://api.exchange.coinbase.com/products");
       return rows.filter((r) => r.status === "online" && !r.trading_disabled && !r.cancel_only && !r.auction_mode)
-        .flatMap((r) => pair(r.base_currency, r.quote_currency, { rest: r.id, ws: r.id }));
+        .flatMap((r) => pair(r.base_currency, r.quote_currency, { rest: r.id, ws: r.id,
+          rules: orderRules(Number(r.base_increment), Number(r.quote_increment), Number(r.base_increment), Number(r.min_market_funds)) }));
     }
     case "Kraken": {
-      const body = await get<{ result: Record<string, { altname: string; wsname?: string; status: string }> }>("https://api.kraken.com/0/public/AssetPairs");
+      const body = await get<{ result: Record<string, { altname: string; wsname?: string; status: string; lot_decimals: number; pair_decimals: number; tick_size?: string; ordermin?: string; costmin?: string }> }>("https://api.kraken.com/0/public/AssetPairs");
       return Object.entries(body.result).filter(([, r]) => r.status === "online" && r.wsname?.includes("/")).flatMap(([id, r]) => {
         const [base, quote] = r.wsname!.split("/").map(krakenAsset);
-        return pair(base, quote, { rest: r.altname, ws: `${base}/${quote}`, batch: id });
+        const tick = Number(r.tick_size) || 10 ** -r.pair_decimals;
+        return pair(base, quote, { rest: r.altname, ws: `${base}/${quote}`, batch: id, rules: orderRules(10 ** -r.lot_decimals, tick, Number(r.ordermin), Number(r.costmin)) });
       });
     }
     case "Gemini": {
