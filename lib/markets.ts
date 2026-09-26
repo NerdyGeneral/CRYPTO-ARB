@@ -10,7 +10,12 @@ export type Market = {
   ws: string;
   // Key used by a venue's all-markets endpoint when it differs from `rest` (Kraken's canonical pair name).
   batch?: string;
+  // Order size and price rules, where the exchange publishes them in its public listing (Coinbase, Kraken).
+  rules?: OrderRules;
 };
+
+// lot: order sizes must be whole multiples of this; tick: prices likewise; minQty/minNotional: smallest order.
+export type OrderRules = { lot: number; tick: number; minQty: number; minNotional: number };
 
 export const marketKey = (venue: Venue, base: string, quote: string) => `${venue}|${base}/${quote}`;
 export const keyOf = (market: Market) => marketKey(market.venue, market.base, market.quote);
@@ -21,7 +26,7 @@ export const isDollarStable = (asset: string) => (dollarStablecoins as readonly 
 
 // Exchange-native names for a pair. Kraken's REST names come from its listing when discovered;
 // the default only needs to cover the USD pairs the web page uses.
-export function makeMarket(venue: Venue, base: string, quote: string, names: Partial<Pick<Market, "rest" | "ws" | "batch">> = {}): Market {
+export function makeMarket(venue: Venue, base: string, quote: string, names: Partial<Pick<Market, "rest" | "ws" | "batch" | "rules">> = {}): Market {
   const joined = `${base}${quote}`;
   const [rest, ws] =
     venue === "Coinbase" || venue === "CEX.IO" || venue === "OKX US" ? [`${base}-${quote}`, `${base}-${quote}`] :
