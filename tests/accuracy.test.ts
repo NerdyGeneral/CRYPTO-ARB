@@ -43,3 +43,27 @@ test("verdict shares: suspects that look real, traded routes with a barrier", ()
   assert.equal(s.suspect.unverified, 1);
   assert.equal(verdictSummary([]).suspectRealPct, null);
 });
+
+
+test("unresolved profit stays unknown and is excluded from completed-replay profit metrics", () => {
+  const t = emptyTally();
+  addReplay(t, "partial", 5, null);
+  let a = accuracy(t);
+  assert.equal(a.replays, 1);
+  assert.equal(a.completedReplays, 0);
+  assert.equal(a.unresolvedReplays, 1);
+  assert.equal(a.unresolvedPct, 100);
+  assert.equal(a.meanError, null);
+  assert.equal(a.capturePct, null);
+  assert.equal(a.lossPct, null);
+  addReplay(t, "filled", 2, 1);
+  a = accuracy(t);
+  assert.equal(a.replays, 2);
+  assert.equal(a.completedReplays, 1);
+  assert.equal(a.unresolvedReplays, 1);
+  assert.equal(a.meanError, -1);
+  assert.equal(a.meanAbsError, 1);
+  assert.equal(a.capturePct, 50);
+  assert.equal(t.expected, 7);
+  assert.equal(t.expectedComplete, 2);
+});

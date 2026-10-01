@@ -3,8 +3,8 @@ import crypto from "node:crypto";
 import { test } from "node:test";
 import { sendInParallel } from "../lib/execution";
 import { makeMarket } from "../lib/markets";
-import type { Leg } from "../lib/opportunities";
-import { checkLeg, coinbaseCreateOrder, floorToStep, formatStep, krakenAddOrder } from "../lib/orders";
+import type { Leg, Opportunity } from "../lib/opportunities";
+import { checkLeg, coinbaseCreateOrder, floorToStep, formatStep, krakenAddOrder, normalizeLeg, floorToCommonStep, normalizeCrossOpportunity } from "../lib/orders";
 import { coinbaseJwt, krakenSignature } from "../lib/signing";
 
 const leg = (over: Partial<Leg> = {}): Leg => ({ venue: "Kraken", pair: "BTC/USD", base: "BTC", quote: "USD", side: "buy", price: 84000.1, market: "Kraken|BTC/USD", size: 1, qty: 0.000595241, fee: 0.004, ...over });
@@ -64,4 +64,47 @@ test("legs are sent at the same time, and one failure doesn't hide the others", 
   assert.ok(performance.now() - started < 110, "three 60 ms sends overlap instead of running one after another");
   assert.ok(Math.max(...sent.map((s) => s.startedAt)) - Math.min(...sent.map((s) => s.startedAt)) < 5);
   assert.deepEqual(sent.map((s) => [s.result, s.error]), [["Kraken", null], ["Coinbase", null], [null, "rejected"]]);
+});
+
+
+test("arbitrary decimal lots remain exact and cannot round an undersized amount upward", () => {
+  assert.equal(floorToStep(1.249, 0.125), 1.125);
+  assert.equal(floorToStep(1.25, 0.125), 1.25);
+  assert.equal(floorToStep(0.999999999999, 0.125), 0.875);
+  assert.equal(floorToStep(0.001249, 0.000125), 0.001125);
+  assert.equal(formatStep(1.125, 0.125), "1.125");
+  assert.equal(formatStep(0.001125, 0.000125), "0.001125");
+  assert.throws(() => floorToStep(1, 0), /increments positive/);
+});
+
+test("order builders and replay normalization use the same quantities and protective tick prices", () => {
+  const rules = { lot: 0.125, tick: 0.25, minQty: 0.125, minNotional: 1 };
+  const market = makeMarket("Kraken", "BTC", "USD", { rules });
+  const buy = leg({ qty: 1.251, price: 100.13 });
+  const sell = leg({ qty: 1.251, price: 100.13, side: "sell" });
+  assert.deepEqual(checkLeg(buy, rules), { qty: 1.25, price: 100, problem: null });
+  assert.equal(normalizeLeg(sell, rules).price, 100.25);
+  const kraken = krakenAddOrder(buy, market, { token: "T", reqId: 1 });
+  assert.equal(kraken.params.order_qty, 1.25);
+  assert.equal(kraken.params.limit_price, 100);
+  const coinbase = coinbaseCreateOrder(sell, makeMarket("Coinbase", "BTC", "USD", { rules }), "order");
+  assert.equal(coinbase.body.order_configuration.sor_limit_ioc.base_size, "1.250");
+  assert.equal(coinbase.body.order_configuration.sor_limit_ioc.limit_price, "100.25");
+});
+
+
+test("cross orders share the exact common lot and scale expected costs to their actual size", () => {
+  assert.equal(floorToCommonStep(1.01, [0.03, 0.02]), 0.96);
+  assert.equal(floorToCommonStep(1.13, [0.125, 0.05]), 1);
+  const buy = leg({ qty: 1.201, price: 100 }), sell = leg({ venue: "Coinbase", qty: 1.201, side: "sell", price: 102 });
+  const route: Opportunity = { key: "cross", kind: "cross", coin: "BTC", venues: ["Kraken", "Coinbase"], path: "", legs: [buy, sell],
+    notional: 120.1, grossPct: 2, net: 1.201, netPct: 1, fees: 0.5, conversion: 0, buffer: 0.1, ageMs: 0, suspect: false };
+  const rulesFor = (leg: Leg) => ({ lot: leg.venue === "Kraken" ? 0.03 : 0.02, tick: 0.01, minQty: 0, minNotional: 1 });
+  const result = normalizeCrossOpportunity(route, rulesFor);
+  assert.equal(result.problem, null);
+  assert.deepEqual(result.opportunity?.legs.map((leg) => leg.qty), [1.2, 1.2]);
+  assert.equal(result.opportunity?.net, 1.2);
+  assert.equal(result.opportunity?.notional, 120.1 * (1.2 / 1.201));
+  const badPrice = normalizeCrossOpportunity({ ...route, legs: [{ ...buy, price: 100.001 }, sell] }, rulesFor);
+  assert.match(badPrice.problem!, /order tick/);
 });

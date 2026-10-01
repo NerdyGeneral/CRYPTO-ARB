@@ -88,10 +88,14 @@
   label.field { display: flex; flex-direction: column; gap: 4px; font-size: 13px; }
   label.field small, .hint { color: var(--muted); font-size: 12px; }
   label.check { display: flex; gap: 8px; align-items: center; font-size: 13px; }
-  input[type=number], input[type=text] { font: 14px var(--mono); color: var(--text); background: var(--panel2); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; width: 100%; }
+  input[type=number], input[type=text], select { font: 14px var(--mono); color: var(--text); background: var(--panel2); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; width: 100%; }
   input:focus { outline: 2px solid #e9a96a55; border-color: var(--accent); }
   .actions { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-top: 16px; }
   #saveResult { font-size: 13px; }
+  .alert { border: 1px solid var(--neg); border-radius: 8px; background: #321e20; padding: 12px 16px; color: var(--neg); }
+  .inventory-form { padding: 0 16px 16px; }
+  .inventory-form .actions { margin-top: 10px; }
+  [hidden] { display: none !important; }
 </style>
 </head>
 <body>
@@ -104,7 +108,9 @@
       <button id="reset" class="ghost" disabled>Reset session</button>
     </div>
   </header>
-  <p class="note">Simulated trades only. Nothing is sent to an exchange. Paper results assume pre-funded balances on every exchange used, fills at the quoted size, and no transfer or withdrawal costs. Realistic results replay each trade against the order books as they stood when real orders would have arrived.</p>
+  <p class="note">Simulated trades only. Nothing is sent to an exchange. Quote estimates are compared with simulated execution using observed books, fees, venue balances and a public-probe delay assumption. These are not exchange fills or proof of actual profit. Inventory, missing prices and unresolved exits can prevent trades.</p>
+  <p id="auditError" class="alert" role="alert" hidden></p>
+  <p id="legacyNote" class="note warn" hidden></p>
   <p class="coverage" id="coverage">Finding markets on each exchange…</p>
 
   <nav class="tabs">
@@ -117,17 +123,33 @@
 
   <div class="tab" id="tab-overview">
     <div class="stats">
-      <div class="stat"><small>Paper balance</small><strong id="balance">—</strong><span id="start">&nbsp;</span></div>
-      <div class="stat"><small>Paper P&amp;L</small><strong id="pnl">—</strong><span>quotes as seen</span></div>
-      <div class="stat"><small>Realistic P&amp;L</small><strong id="shadowPnl">—</strong><span id="shadowSub">replayed at real latency</span></div>
+      <div class="stat"><small>Paper portfolio equity</small><strong id="balance">—</strong><span id="start">&nbsp;</span></div>
+      <div class="stat"><small>Paper portfolio P&amp;L</small><strong id="pnl">—</strong><span>includes inventory preparation costs</span></div>
+      <div class="stat"><small>Simulated execution P&amp;L</small><strong id="shadowPnl">—</strong><span id="shadowSub">public-probe delay assumption</span></div>
       <div class="stat"><small>Simulated trades</small><strong id="trades">—</strong><span id="scans">&nbsp;</span></div>
       <div class="stat"><small>Best cross / triangle</small><strong id="best">—</strong><span>net, this hour</span></div>
       <div class="stat"><small>Running for</small><strong id="uptime">—</strong><span id="since">&nbsp;</span></div>
     </div>
 
+    <section aria-labelledby="inventoryHeading">
+      <h2 id="inventoryHeading">Paper inventory</h2>
+      <p class="sub">Starting USD is distributed across selected venues. Cross-exchange sales need coins already held at the selling venue; balances never move automatically between venues. Prepare inventory with a simulated USD buy or sell below. Existing balances, fees, current book size and order rules apply.</p>
+      <p class="sub" id="inventoryPending"></p>
+      <div class="scroll"><table><thead><tr><th>Venue</th><th>Asset</th><th class="num">Held</th><th class="num">Reserved</th><th class="num">Available</th></tr></thead><tbody id="inventoryBalances"></tbody></table></div>
+      <form id="inventoryForm" class="inventory-form">
+        <div class="fields">
+          <label class="field">USD market<select id="inventoryMarket" required aria-describedby="inventoryQuote"></select></label>
+          <label class="field">Action<select id="inventorySide"><option value="buy">Buy with paper USD</option><option value="sell">Sell held coins for paper USD</option></select></label>
+          <label class="field">Quantity of coin<input id="inventoryQuantity" type="number" min="0" step="any" required inputmode="decimal" placeholder="e.g. 0.001"><small>Base-coin units, not a dollar budget.</small></label>
+        </div>
+        <p class="hint" id="inventoryQuote">Waiting for fresh USD markets.</p>
+        <div class="actions"><button id="inventorySubmit" type="submit" disabled>Simulate inventory trade</button><span id="inventoryResult" class="muted" role="status"></span></div>
+      </form>
+    </section>
+
     <section>
       <h2>Current best routes</h2>
-      <p class="sub">Net includes every taker fee, stablecoin conversion and the price buffer. The last column says why a route was or wasn't paper-traded.</p>
+      <p class="sub">Estimates include configured taker fees, modeled stablecoin conversion and the price buffer. The last column says why a route was or wasn't paper-traded.</p>
       <div class="scroll"><table><thead><tr><th>Route</th><th class="num">Size</th><th class="num">Raw gap</th><th class="num">Fees</th><th class="num">Est. net</th><th>Status</th></tr></thead><tbody id="routes"></tbody></table></div>
     </section>
 
@@ -139,67 +161,68 @@
 
     <section>
       <h2>Exchange feeds</h2>
-      <p class="sub">Live = order books with a quote under 12 seconds old. Latency is the round trip from this PC over a connection kept open to each exchange (median, and the time 95% of requests beat), used to replay trades realistically.</p>
+      <p class="sub">Live books pass freshness checks. Latency measures public API probes, not order acknowledgements. Public-probe p95 is a simulation delay assumption; it does not establish achievable trading latency.</p>
       <div class="scroll"><table><thead><tr><th>Exchange</th><th class="num">Live books</th><th>Source</th><th class="num">Last quote</th><th class="num">Latency</th><th class="num">Poll errors</th></tr></thead><tbody id="feeds"></tbody></table></div>
     </section>
   </div>
 
   <div class="tab" id="tab-trades">
     <div class="stats">
-      <div class="stat"><small>Paper P&amp;L</small><strong id="tPaper">—</strong><span>if every trade filled as seen</span></div>
-      <div class="stat"><small>Realistic P&amp;L</small><strong id="tReal">—</strong><span id="tRealSince">&nbsp;</span></div>
-      <div class="stat"><small>Filled fully</small><strong id="tFilled">—</strong><span>both sides still there</span></div>
-      <div class="stat"><small>One side only</small><strong id="tPartial">—</strong><span>unwound at a cost</span></div>
-      <div class="stat"><small>Missed</small><strong id="tMissed">—</strong><span>price gone, nothing filled</span></div>
+      <div class="stat"><small>Quoted P&amp;L estimate</small><strong id="tPaper">—</strong><span>sum of accepted quote estimates</span></div>
+      <div class="stat"><small>Simulated execution P&amp;L</small><strong id="tReal">—</strong><span id="tRealSince">&nbsp;</span></div>
+      <div class="stat"><small>Filled fully</small><strong id="tFilled">—</strong><span>all simulated legs filled</span></div>
+      <div class="stat"><small>Partial execution</small><strong id="tPartial">—</strong><span>may leave unresolved exposure</span></div>
+      <div class="stat"><small>Missed</small><strong id="tMissed">—</strong><span>no simulated fill</span></div>
+      <div class="stat"><small>Unresolved P&amp;L</small><strong id="tUnresolved">—</strong><span>excluded from complete results</span></div>
     </div>
 
     <section>
-      <h2>Reality check</h2>
-      <p class="sub">Each paper trade replayed as immediate-or-cancel orders against the books one round trip later. Saved to <code>shadow.csv</code>.</p>
-      <div class="scroll"><table><thead><tr><th>Time</th><th>Route</th><th class="num">Paper</th><th class="num">Realistic</th><th>Outcome</th><th class="num">Latency</th></tr></thead><tbody id="shadow"></tbody></table></div>
+      <h2>Execution simulation</h2>
+      <p class="sub">Immediate-or-cancel simulations use public-probe p95 delay assumptions. Cross-exchange legs reserve separate venue balances; triangle legs run sequentially. Missing exit or conversion evidence leaves P&amp;L unresolved. Recorded simulation evidence is in <code>audit.jsonl</code>; <code>shadow.csv</code> is a summary.</p>
+      <div class="scroll"><table><thead><tr><th>Time</th><th>Route</th><th class="num">Paper</th><th class="num">Simulated execution</th><th>Outcome</th><th class="num">Latency</th></tr></thead><tbody id="shadow"></tbody></table></div>
     </section>
 
     <section>
       <h2>Paper trade log</h2>
-      <p class="sub">Latest 50; the full log is <code>trades.csv</code>.</p>
-      <div class="scroll"><table><thead><tr><th>Time</th><th>Route</th><th class="num">Size</th><th class="num">Raw gap</th><th class="num">Net</th></tr></thead><tbody id="log"></tbody></table></div>
+      <p class="sub">Latest 50 quote estimates; these are not cash profits. <code>trades.csv</code> is a summary; <code>audit.jsonl</code> contains execution evidence.</p>
+      <div class="scroll"><table><thead><tr><th>Time</th><th>Route</th><th class="num">Size</th><th class="num">Raw gap</th><th class="num">Estimated net</th></tr></thead><tbody id="log"></tbody></table></div>
     </section>
 
     <section>
       <h2>Hourly summary</h2>
-      <p class="sub">One row per hour, saved to <code>hourly.csv</code>. “Didn't work” is the share of replayed trades that filled on one side only or not at all.</p>
-      <div class="scroll"><table><thead><tr><th>Hour</th><th class="num">Trades</th><th class="num">Paper P&amp;L</th><th class="num">Realistic</th><th class="num">Didn't work</th><th class="num">Best cross</th><th class="num">Best triangle</th><th class="num">Suspect</th></tr></thead><tbody id="hours"></tbody></table></div>
+      <p class="sub">One row per hour in <code>hourly.csv</code>. Unresolved hours have no aggregate execution P&amp;L; the completed-result subtotal remains available. “Incomplete fill” counts partial or missed simulations.</p>
+      <div class="scroll"><table><thead><tr><th>Hour</th><th class="num">Trades</th><th class="num">Quoted estimate</th><th class="num">Simulated execution</th><th class="num">Incomplete fill</th><th class="num">Best cross</th><th class="num">Best triangle</th><th class="num">Suspect</th></tr></thead><tbody id="hours"></tbody></table></div>
     </section>
   </div>
 
   <div class="tab" id="tab-accuracy">
     <div class="stats">
-      <div class="stat"><small>Wouldn't have worked</small><strong id="aWrong">—</strong><span id="aWrongSub">of replayed paper trades</span></div>
-      <div class="stat"><small>Avg estimate error</small><strong id="aError">—</strong><span id="aErrorSub">realistic − paper, per trade</span></div>
-      <div class="stat"><small>Profit turned loss</small><strong id="aLoss">—</strong><span>predicted a profit, would have lost</span></div>
-      <div class="stat"><small>Paper profit kept</small><strong id="aCapture">—</strong><span>realistic ÷ paper</span></div>
-      <div class="stat"><small>Suspects that look real</small><strong id="aSuspect">—</strong><span id="aSuspectSub">no barrier found</span></div>
+      <div class="stat"><small>Incomplete fills</small><strong id="aWrong">—</strong><span id="aWrongSub">of replayed paper trades</span></div>
+      <div class="stat"><small>Avg estimate error</small><strong id="aError">—</strong><span id="aErrorSub">simulated execution − paper, per trade</span></div>
+      <div class="stat"><small>Profit turned loss</small><strong id="aLoss">—</strong><span>positive estimate, negative completed simulation</span></div>
+      <div class="stat"><small>Paper profit kept</small><strong id="aCapture">—</strong><span>simulated execution ÷ paper</span></div>
+      <div class="stat"><small>Suspects with no barrier found</small><strong id="aSuspect">—</strong><span id="aSuspectSub">no barrier found</span></div>
       <div class="stat"><small>Traded routes with a barrier</small><strong id="aTraded">—</strong><span id="aTradedSub">under the gap limit</span></div>
     </div>
 
     <section>
-      <h2>Paper trades that wouldn't have worked, by hour</h2>
-      <p class="sub">Each bar splits that hour's replayed trades by outcome. The red line is the share that was predicted to make money but would have lost it.</p>
-      <div class="legend"><span><i style="background:var(--pos)"></i>Filled</span><span><i style="background:var(--warn)"></i>One side only</span><span><i style="background:var(--grey)"></i>Missed</span><span><i class="line" style="background:var(--neg)"></i>Profit turned loss</span></div>
+      <h2>Simulated execution outcomes, by hour</h2>
+      <p class="sub">Each bar splits that hour's replayed trades by outcome. The red line is the share of completed simulations with positive estimates and negative results.</p>
+      <div class="legend"><span><i style="background:var(--pos)"></i>Filled</span><span><i style="background:var(--warn)"></i>Partial execution</span><span><i style="background:var(--grey)"></i>Missed</span><span><i class="line" style="background:var(--neg)"></i>Profit turned loss</span></div>
       <div class="chart" id="chartOutcomes"></div>
     </section>
 
     <div class="grid2">
       <section>
-        <h2>Paper vs realistic profit, by hour</h2>
+        <h2>Paper vs simulated execution profit, by hour</h2>
         <p class="sub">How much of each hour's paper profit survives the replay.</p>
-        <div class="legend"><span><i style="background:#e9a96a88"></i>Paper</span><span><i style="background:var(--pos)"></i>Realistic</span><span><i style="background:var(--neg)"></i>Realistic loss</span></div>
+        <div class="legend"><span><i style="background:#e9a96a88"></i>Paper</span><span><i style="background:var(--pos)"></i>Simulated execution</span><span><i style="background:var(--neg)"></i>Simulated execution loss</span></div>
         <div class="chart" id="chartProfit"></div>
       </section>
       <section>
         <h2>Estimate error per trade</h2>
-        <p class="sub" id="errorNote">Realistic minus paper net for the latest replays. Left of zero: the paper estimate was too optimistic.</p>
-        <div class="legend"><span><i style="background:var(--neg)"></i>Paper too optimistic</span><span><i style="background:var(--pos)"></i>Realistic did as well or better</span></div>
+        <p class="sub" id="errorNote">Simulated execution minus paper net for the latest replays. Left of zero: the paper estimate was too optimistic.</p>
+        <div class="legend"><span><i style="background:var(--neg)"></i>Paper too optimistic</span><span><i style="background:var(--pos)"></i>Simulated execution did as well or better</span></div>
         <div class="chart" id="chartErrors"></div>
       </section>
     </div>
@@ -211,24 +234,25 @@
       <div class="vrow"><b id="suspectBarLabel">Suspect gaps (above the limit, never traded)</b><div id="suspectBar"></div></div>
       <div class="vrow"><b id="tradedBarLabel">Paper-traded routes (under the limit)</b><div id="tradedBar"></div></div>
       <div class="vrow"><b>Blocked from paper trading</b><p class="hint" style="margin:0" id="barrierList"></p></div>
-      <p class="sub">A suspect with no barrier found means the rule may have been too cautious. A traded route with a barrier means it wasn't cautious enough: with money already on both exchanges one trade still goes through, but closed transfers or a different token stop you rebalancing, so the gap can't be repeated.</p>
+      <p class="sub">A suspect with no barrier found is still unverified; it does not establish executable profit. A traded route with a barrier means it wasn't cautious enough: separate venue inventory, token identity and executable books must all be checked. A public verification result cannot prove a fill or a profit.</p>
     </section>
   </div>
 
   <div class="tab" id="tab-funding">
-    <p class="note" id="carryNote">Paper only. Buy a coin on the cheapest exchange and short the same amount of its US perpetual future on Coinbase (Coinbase Financial Markets, CFTC-regulated). Price moves cancel out; while the future trades above spot, the short collects the hourly funding that longs pay.</p>
+    <p class="note" id="carryNote">Paper carry estimates only. Holding spot and short futures can reduce price exposure, but basis, fees, funding and margin still affect results. Public rates do not supply the required settlement-time futures mark, so funding amounts remain unresolved.</p>
+    <p class="alert" id="carryAccounting" role="status" hidden></p>
     <div class="stats">
       <div class="stat"><small>Carry account</small><strong id="cEquity">—</strong><span id="cCapital">&nbsp;</span></div>
-      <div class="stat"><small>Carry P&amp;L</small><strong id="cPnl">—</strong><span id="cApr">&nbsp;</span></div>
-      <div class="stat"><small>Funding collected</small><strong id="cFunding">—</strong><span>all positions</span></div>
-      <div class="stat"><small>Fees paid</small><strong id="cFees">—</strong><span>both legs, in and out</span></div>
+      <div class="stat"><small>Carry P&amp;L estimate</small><strong id="cPnl">—</strong><span id="cApr">&nbsp;</span></div>
+      <div class="stat"><small>Confirmed funding inputs</small><strong id="cFunding">—</strong><span id="cFundingSub">unresolved amounts excluded</span></div>
+      <div class="stat"><small>Modeled fees</small><strong id="cFees">—</strong><span>both legs, in and out</span></div>
       <div class="stat"><small>Open positions</small><strong id="cOpen">—</strong><span id="cCash">&nbsp;</span></div>
     </div>
 
     <section>
       <h2>Open positions</h2>
-      <p class="sub">Coins held on the spot exchange, short futures on Coinbase. "Net if closed now" sells the coins at the bid and buys the short back at the ask, fees included. Margin shows how far the futures price can rise before the short's collateral falls below the overnight margin; positions close automatically before 10%.</p>
-      <div class="scroll"><table><thead><tr><th>Coin</th><th>Size</th><th class="num">Held</th><th class="num">Funding</th><th class="num">Price legs</th><th class="num">Fees</th><th class="num">Net if closed now</th><th class="num">Room to margin call</th></tr></thead><tbody id="cPositions"></tbody></table></div>
+      <p class="sub">Exit estimates use spot bids and futures asks with modeled fees. A last-known mark remains visible when prices go stale; it is not current executable value. Closing is deferred if either leg lacks size. Funding gaps remain unresolved, and the margin model is not an exchange liquidation guarantee.</p>
+      <div class="scroll"><table><thead><tr><th>Coin</th><th>Size</th><th class="num">Held</th><th class="num">Funding</th><th class="num">Price legs</th><th class="num">Fees</th><th class="num">Exit estimate</th><th class="num">Room to margin call</th></tr></thead><tbody id="cPositions"></tbody></table></div>
     </section>
 
     <section>
@@ -239,13 +263,13 @@
 
     <section>
       <h2>Dated futures (for comparison)</h2>
-      <p class="sub">Short the nearest monthly future and hold the coin to expiry: the gap is locked in at the start. Net is after fees and the spot spread; yearly return is on coins plus collateral. Not paper-traded yet.</p>
+      <p class="sub">Indicative basis comparison after modeled fees and spread, not a guaranteed return. Expiry settlement, execution and margin assumptions require separate validation. These contracts are not paper-traded.</p>
       <div class="scroll"><table><thead><tr><th>Coin</th><th>Contract</th><th class="num">Days left</th><th class="num">Basis</th><th class="num">Net to expiry</th><th class="num">Yearly on capital</th><th>Spot</th></tr></thead><tbody id="cDated"></tbody></table></div>
     </section>
 
     <section>
       <h2>Activity</h2>
-      <p class="sub">Opens, hourly funding payments and closes, newest first. The full log is <code>carry.csv</code>; every hourly rate is saved to <code>funding.csv</code>.</p>
+      <p class="sub">Opens, unresolved funding observations and paper closes, newest first. The full log is <code>carry.csv</code>; every hourly rate is saved to <code>funding.csv</code>.</p>
       <div class="scroll"><table><thead><tr><th>Time</th><th>Event</th><th>Coin</th><th class="num">Rate</th><th class="num">Amount</th><th>Note</th></tr></thead><tbody id="cEvents"></tbody></table></div>
     </section>
   </div>
@@ -288,8 +312,8 @@
           <label class="check"><input type="checkbox" name="c.enabled"> Follow Coinbase's US perpetual futures and paper-trade the carry</label>
           <label class="field">Carry capital (USD)<input type="number" name="c.capital" step="100"><small>Coins plus collateral across all positions.</small></label>
           <label class="field">Most positions at once<input type="number" name="c.maxPositions" step="1"><small>Capital is shared evenly between them.</small></label>
-          <label class="field">Collateral (% of the short)<input type="number" name="c.marginBuffer" step="5"><small>100% means no leverage. Lower returns more but gets margin-called sooner.</small></label>
-          <label class="field">Futures taker fee (%)<input type="number" name="c.futuresFee" step="0.01"><small>Per side. Coinbase lists 0.03% plus exchange fees.</small></label>
+          <label class="field">Collateral (% of the short)<input type="number" name="c.marginBuffer" step="5"><small>Collateral held against the short. Lower collateral increases margin exposure.</small></label>
+          <label class="field">Futures taker fee (%)<input type="number" name="c.futuresFee" step="0.01"><small>Modeled per-side fee. Set the applicable account and contract rate.</small></label>
           <label class="field">Minimum net return (%/yr)<input type="number" name="c.minNetApr" step="0.5"><small>On the capital used, after all fees.</small></label>
           <label class="field">Close below (%/yr)<input type="number" name="c.exitApr" step="0.5"><small>When the last 6 hours of funding average below this.</small></label>
           <label class="field">Expected holding time (days)<input type="number" name="c.holdDays" step="1"><small>Round-trip fees are spread over this when judging an entry.</small></label>
@@ -317,12 +341,13 @@
 <script>
   const $ = (id) => document.getElementById(id);
   const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
-  const money = (n, d = 2) => (n < 0 ? "−" : "") + "$" + Math.abs(n).toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d });
-  const signed = (n) => (n >= 0 ? "+" : "−") + money(Math.abs(n), Math.abs(n) < 1 && n !== 0 ? 3 : 2);
+  const finite = (n) => typeof n === "number" && Number.isFinite(n);
+  const money = (n, d = 2) => !finite(n) ? "—" : (n < 0 ? "−" : "") + "$" + Math.abs(n).toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d });
+  const signed = (n) => !finite(n) ? "—" : (n >= 0 ? "+" : "−") + money(Math.abs(n), Math.abs(n) < 1 && n !== 0 ? 3 : 2);
   const pct = (n) => n === null || n === undefined || n === "" || Number.isNaN(Number(n)) ? "—" : (Number(n) >= 0 ? "+" : "−") + Math.abs(Number(n)).toFixed(2) + "%";
   const share = (n) => n === null || n === undefined ? "—" : n.toFixed(n > 0 && n < 10 ? 1 : 0) + "%";
-  const num = (v) => v === "" || v === undefined || v === null ? null : Number(v);
-  const cls = (n) => n === null || n === undefined ? "muted" : n > 0 ? "pos" : n < 0 ? "neg" : "muted";
+  const num = (v) => v === "" || v === undefined || v === null || !Number.isFinite(Number(v)) ? null : Number(v);
+  const cls = (n) => !finite(n) ? "muted" : n > 0 ? "pos" : n < 0 ? "neg" : "muted";
   const ago = (ms) => ms === null ? "never" : ms < 1500 ? "now" : ms < 90000 ? Math.round(ms / 1000) + "s ago" : Math.round(ms / 60000) + "m ago";
   const duration = (ms) => { const m = Math.floor(ms / 60000), h = Math.floor(m / 60), d = Math.floor(h / 24); return d ? `${d}d ${h % 24}h` : h ? `${h}h ${m % 60}m` : `${Math.max(m, 0)}m`; };
   const when = (t) => new Date(t).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit", second: "2-digit" });
@@ -350,21 +375,57 @@
 
   // Hourly rows, oldest first: saved hours from hourly.csv, then the hour in progress.
   function hourRows(s) {
-    const saved = s.hours.map((h) => ({ hour: h.hour, trades: Number(h.trades), pnl: Number(h.pnl_usd), bestNetPct: num(h.best_net_pct),
-      bestTriangleNetPct: num(h.best_triangle_net_pct), suspectRoutes: Number(h.suspect_routes),
-      shadow: { expected: Number(h.shadow_expected_usd), realized: Number(h.shadow_pnl_usd), absError: Number(h.shadow_abs_error_usd),
-        filled: Number(h.shadow_filled), partial: Number(h.shadow_partial), missed: Number(h.shadow_missed), losses: Number(h.shadow_losses) } }));
-    return [...saved.reverse(), { ...s.currentHour, current: true }];
+    const saved = s.hours.map((h) => {
+      const unresolved = num(h.shadow_unresolved), settled = num(h.shadow_pnl_usd);
+      return { hour: h.hour, trades: Number(h.trades), pnl: num(h.pnl_usd), bestNetPct: num(h.best_net_pct),
+        bestTriangleNetPct: num(h.best_triangle_net_pct), suspectRoutes: Number(h.suspect_routes),
+        shadow: { expected: num(h.shadow_expected_usd), realized: unresolved === 0 ? settled : null, settled,
+          unresolved, absError: num(h.shadow_abs_error_usd), filled: Number(h.shadow_filled), partial: Number(h.shadow_partial),
+          missed: Number(h.shadow_missed), losses: Number(h.shadow_losses) } };
+    });
+    const current = s.currentHour, sh = current.shadow;
+    return [...saved.reverse(), { ...current, current: true, shadow: { ...sh, settled: sh.realized, realized: sh.unresolved ? null : sh.realized } }];
   }
   const replays = (t) => t.filled + t.partial + t.missed;
+  const quotedPnl = (s) => s.session.shadow?.expected ?? null;
+  const executionPnl = (s) => s.shadow.unresolved ? "Unresolved" : signed(s.shadow.pnl);
+
+  let inventoryMarkets = [], inventoryBusy = false, inventoryMarketKeys = "";
+  const units = (n) => !finite(n) ? "—" : n !== 0 && Math.abs(n) < 1e-8 ? n.toPrecision(5) : n.toLocaleString("en-US", { maximumFractionDigits: 10 });
+  function inventoryQuote() {
+    const market = inventoryMarkets.find((m) => m.key === $("inventoryMarket").value), side = $("inventorySide").value;
+    $("inventoryQuote").textContent = market ? `${market.coin} on ${market.venue}: bid ${money(market.bid, market.bid < 1 ? 8 : 2)} / ask ${money(market.ask, market.ask < 1 ? 8 : 2)}. ${side === "buy" ? "Buy uses the ask plus fees." : "Sell uses the bid less fees."} Final simulated quantity depends on available balance, book depth and order rules.` : "Waiting for fresh USD markets.";
+  }
+  function renderInventory(s) {
+    const p = s.portfolio;
+    inventoryMarkets = p?.markets || [];
+    const keys = inventoryMarkets.map((m) => m.key).join("\n");
+    if (keys !== inventoryMarketKeys || !$("inventoryMarket").options.length) {
+      const selected = $("inventoryMarket").value;
+      $("inventoryMarket").innerHTML = '<option value="">' + (inventoryMarkets.length ? "Select a USD market" : "No fresh USD markets") + '</option>' + inventoryMarkets.map((m) => `<option value="${esc(m.key)}">${esc(m.venue)} · ${esc(m.coin)}/USD</option>`).join("");
+      $("inventoryMarket").value = inventoryMarkets.some((m) => m.key === selected) ? selected : "";
+      inventoryMarketKeys = keys;
+    }
+    const holdings = Object.entries(p?.balances || {}).flatMap(([venue, assets]) => Object.entries(assets).map(([asset, held]) => {
+      const available = p.available?.[venue]?.[asset];
+      return { venue, asset, held, available, reserved: finite(available) ? Math.max(0, held - available) : null };
+    })).sort((a, b) => a.venue.localeCompare(b.venue) || a.asset.localeCompare(b.asset));
+    rows("inventoryBalances", holdings, (h) => `<tr><td>${esc(h.venue)}</td><td>${esc(h.asset)}</td><td class="num">${units(h.held)}</td><td class="num ${h.reserved > 0 ? "warn" : "muted"}">${units(h.reserved)}</td><td class="num">${units(h.available)}</td></tr>`, 5, "Paper inventory is not available yet.");
+    $("inventoryPending").textContent = `${p?.pending ?? 0} pending reservation(s). Reserved assets cannot fund another trade.${p?.missing?.length ? ` Missing valuation: ${p.missing.join(", ")}.` : ""}`;
+    $("inventorySubmit").disabled = inventoryBusy || !s.ready || !!s.auditError || !$("inventoryMarket").value;
+    inventoryQuote();
+  }
 
   function renderOverview(s) {
     const ses = s.session, sh = s.shadow, a = s.accuracy;
-    $("balance").textContent = money(ses.balance);
-    $("start").textContent = "Started at " + money(ses.startingBalance);
-    $("pnl").textContent = signed(ses.pnl); $("pnl").className = cls(ses.pnl);
-    $("shadowPnl").textContent = signed(sh.pnl); $("shadowPnl").className = cls(sh.pnl);
-    $("shadowSub").textContent = a.replays ? `${share(a.wrongPct)} of ${a.replays} replays wouldn't have worked` : "no trades replayed yet";
+    const portfolio = s.portfolio;
+    $("balance").textContent = portfolio?.valuationComplete ? money(portfolio.equity) : "Unavailable";
+    $("balance").className = portfolio?.valuationComplete ? "" : "warn";
+    $("start").textContent = `Started at ${money(ses.startingBalance)}; ${portfolio?.valuationComplete ? "local USD bid valuation after modeled fees" : "missing executable valuation"}`;
+    $("pnl").textContent = portfolio?.valuationComplete ? signed(portfolio.pnl) : "Unresolved";
+    $("pnl").className = portfolio?.valuationComplete ? cls(portfolio.pnl) : "warn";
+    $("shadowPnl").textContent = executionPnl(s); $("shadowPnl").className = cls(sh.pnl);
+    $("shadowSub").textContent = sh.unresolved ? `${sh.unresolved} unresolved; completed subtotal ${signed(sh.settledPnl)}` : a.replays ? `${a.replays} simulations; public-probe delay assumption` : "no trades simulated yet";
     $("trades").textContent = ses.tradeCount.toLocaleString();
     $("scans").textContent = ses.scans.toLocaleString() + " scans";
     $("best").innerHTML = `<span class="${cls(s.currentHour.bestNetPct)}">${pct(s.currentHour.bestNetPct)}</span> / <span class="${cls(s.currentHour.bestTriangleNetPct)}">${s.triangular ? pct(s.currentHour.bestTriangleNetPct) : "off"}</span>`;
@@ -389,18 +450,19 @@
 
     rows("feeds", s.feeds, (f) => `<tr><td>${esc(f.venue)}${f.indicative ? ' <span class="muted">(indicative)</span>' : ""}</td><td class="num ${f.live >= f.markets * 0.9 ? "pos" : f.live ? "warn" : "neg"}">${f.live}/${f.markets}</td>` +
       `<td>${f.streaming ? '<span class="pos">Streaming</span>' : f.restQuotes ? '<span class="warn">Polling</span>' : '<span class="neg">No data</span>'}</td>` +
-      `<td class="num muted">${ago(f.lastQuoteAgoMs)}</td><td class="num ${f.latencyMeasured ? "" : "muted"}" title="${f.latencyMeasured ? `Round trip over a kept-open connection: median ${f.latencyMs} ms, 95% within ${f.latencyP95Ms} ms; reconnected ${f.reconnects} times` : ""}">${f.latencyMeasured ? `${f.latencyMs} ms <span class="muted">· p95 ${f.latencyP95Ms}</span>` : "measuring"}</td><td class="num muted">${f.restErrors}</td></tr>`, 6, "Starting…");
+      `<td class="num muted">${ago(f.lastQuoteAgoMs)}</td><td class="num ${f.latencyMeasured ? "" : "muted"}" title="${f.latencyMeasured ? `Public API probe round trip (not an order acknowledgement): median ${f.latencyMs} ms, 95% within ${f.latencyP95Ms} ms; reconnected ${f.reconnects} times` : ""}">${f.latencyMeasured ? `${f.latencyMs} ms <span class="muted">· p95 ${f.latencyP95Ms}</span>` : "measuring"}</td><td class="num muted">${f.restErrors}</td></tr>`, 6, "Starting…");
   }
 
   function renderTrades(s) {
     const sh = s.shadow;
-    $("tPaper").textContent = signed(s.session.pnl); $("tPaper").className = cls(s.session.pnl);
-    $("tReal").textContent = signed(sh.pnl); $("tReal").className = cls(sh.pnl);
-    $("tRealSince").textContent = "since " + new Date(sh.since).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+    $("tPaper").textContent = signed(quotedPnl(s)); $("tPaper").className = cls(quotedPnl(s));
+    $("tReal").textContent = executionPnl(s); $("tReal").className = cls(sh.pnl);
+    $("tRealSince").textContent = `${sh.unresolved ? "Incomplete; " : ""}completed-result subtotal ${signed(sh.settledPnl)}; since ${new Date(sh.since).toLocaleDateString()}`;
+    $("tUnresolved").textContent = sh.unresolved ?? 0; $("tUnresolved").className = sh.unresolved ? "warn" : "muted";
     $("tFilled").textContent = sh.filled; $("tPartial").textContent = sh.partial; $("tMissed").textContent = sh.missed;
-    const outcome = { filled: '<span class="pos">Filled</span>', partial: '<span class="warn">One side only</span>', missed: '<span class="muted">Missed</span>' };
+    const outcome = { filled: '<span class="pos">Filled</span>', partial: '<span class="warn">Partial</span>', missed: '<span class="muted">Missed</span>' };
     rows("shadow", sh.recent, (r) => `<tr><td class="muted">${when(r.time)}</td><td class="wrap">${route(r)}${r.unwound ? `<br><span class="muted">Unwound: ${esc(r.unwound)}</span>` : ""}</td>` +
-      `<td class="num ${cls(r.expectedNet)}">${signed(r.expectedNet)}</td><td class="num ${cls(r.realizedNet)}">${signed(r.realizedNet)}</td><td>${outcome[r.outcome] || esc(r.outcome)}</td><td class="num muted">${r.latencyMs} ms</td></tr>`, 6,
+      `<td class="num ${cls(r.expectedNet)}">${signed(r.expectedNet)}</td><td class="num ${cls(r.realizedNet)}">${r.realizedNet === null ? "Unresolved" : signed(r.realizedNet)}</td><td>${outcome[r.outcome] || esc(r.outcome)}</td><td class="num muted">${r.latencyMs} ms</td></tr>`, 6,
       "No trades replayed yet. Every paper trade is replayed here a moment after it happens.");
     rows("log", s.trades, (t) => `<tr><td class="muted">${when(t.time)}</td><td class="wrap">${route(t)}</td><td class="num">${money(t.notional)}</td>` +
       `<td class="num ${t.grossPct > 0 ? "pos" : "muted"}">${pct(t.grossPct)}</td><td class="num ${cls(t.net)}">${signed(t.net)}</td></tr>`, 5,
@@ -408,7 +470,7 @@
     rows("hours", hourRows(s).reverse(), (h) => {
       const n = replays(h.shadow), wrong = n ? ((h.shadow.partial + h.shadow.missed) / n) * 100 : null;
       return `<tr><td>${new Date(h.hour).toLocaleString([], { month: "short", day: "numeric", hour: "numeric" })}${h.current ? ' <span class="muted">(now)</span>' : ""}</td>` +
-        `<td class="num">${h.trades}</td><td class="num ${cls(h.pnl)}">${signed(h.pnl)}</td><td class="num ${cls(h.shadow.realized)}">${signed(h.shadow.realized)}</td>` +
+        `<td class="num">${h.trades}</td><td class="num ${cls(h.pnl)}">${signed(h.pnl)}</td><td class="num ${cls(h.shadow.realized)}">${h.shadow.realized === null ? `Unresolved<br><span class="muted">subtotal ${signed(h.shadow.settled)}</span>` : signed(h.shadow.realized)}</td>` +
         `<td class="num ${wrong === null ? "muted" : wrong >= 30 ? "neg" : wrong >= 10 ? "warn" : "pos"}">${share(wrong)}</td>` +
         `<td class="num ${cls(h.bestNetPct)}">${pct(h.bestNetPct)}</td><td class="num ${cls(h.bestTriangleNetPct)}">${pct(h.bestTriangleNetPct)}</td><td class="num ${h.suspectRoutes ? "warn" : "muted"}">${h.suspectRoutes}</td></tr>`;
     }, 8, "");
@@ -418,9 +480,9 @@
     const a = s.accuracy, sh = s.shadow, v = a.verdicts;
     $("aWrong").textContent = share(a.wrongPct);
     $("aWrong").className = a.wrongPct === null ? "muted" : a.wrongPct >= 30 ? "neg" : a.wrongPct >= 10 ? "warn" : "pos";
-    $("aWrongSub").textContent = a.replays ? `${sh.partial} one side only, ${sh.missed} missed, of ${a.replays}` : "no trades replayed yet";
+    $("aWrongSub").textContent = a.replays ? `${sh.partial} partial, ${sh.missed} missed; ${sh.unresolved ?? 0} unresolved of ${a.replays}` : "no trades replayed yet";
     $("aError").textContent = a.meanError === null ? "—" : signed(a.meanError); $("aError").className = cls(a.meanError);
-    $("aErrorSub").textContent = a.meanAbsError === null ? "realistic − paper, per trade" : `per trade; typical miss ±${money(a.meanAbsError, 3)}`;
+    $("aErrorSub").textContent = a.meanAbsError === null ? "simulated execution − paper, per trade" : `per completed simulation; typical miss ±${money(a.meanAbsError, 3)}`;
     $("aLoss").textContent = share(a.lossPct); $("aLoss").className = a.lossPct === null ? "muted" : a.lossPct > 0 ? "warn" : "pos";
     $("aCapture").textContent = share(a.capturePct); $("aCapture").className = a.capturePct === null ? "muted" : a.capturePct >= 80 ? "pos" : a.capturePct >= 0 ? "warn" : "neg";
     const decided = (c) => verdictNames.filter(([k]) => k !== "unverified").reduce((n, [k]) => n + c[k], 0);
@@ -444,28 +506,36 @@
   const hoursText = (h) => h < 48 ? `${h.toFixed(1)} h` : `${(h / 24).toFixed(1)} d`;
   function renderCarry(s) {
     const c = s.carry, a = c.account;
+    const carryIssues = [];
+    if (!a.valuationComplete) carryIssues.push(a.equity === null ? "No complete valuation is available yet; missing prices are not a zero-dollar result." : "Valuation is incomplete: last-known prices or insufficient exit depth are shown below.");
+    if (!a.fundingComplete) carryIssues.push(`Funding is incomplete (${a.unresolvedFundingPayments ?? 0} recorded unresolved interval(s)${a.fundingAwaitingObservation ? "; more observations pending" : ""}); unknown credits and debits are excluded.`);
+    if (!a.historyComplete) carryIssues.push("Legacy account history is incomplete and has not been verified.");
+    $("carryAccounting").hidden = carryIssues.length === 0;
+    $("carryAccounting").textContent = carryIssues.join(" ");
     $("cEquity").textContent = money(a.equity);
-    $("cCapital").textContent = `started with ${money(a.capital)}`;
-    $("cPnl").textContent = signed(a.pnl); $("cPnl").className = cls(a.pnl);
-    $("cApr").textContent = a.apr === null ? "yearly rate after a day" : `${apr(a.apr)} a year so far`;
+    $("cCapital").textContent = `started with ${money(a.capital)}${a.valuationComplete ? "" : "; valuation incomplete"}`;
+    $("cPnl").textContent = a.fundingComplete && a.valuationComplete && a.historyComplete ? signed(a.pnl) : "Incomplete";
+    $("cPnl").className = a.fundingComplete && a.valuationComplete && a.historyComplete ? cls(a.pnl) : "warn";
+    $("cApr").textContent = !a.fundingComplete || !a.valuationComplete || !a.historyComplete ? `Known component ${signed(a.pnl)}; excludes unknown funding / current marks` : a.apr === null ? "yearly estimate after a day" : `${apr(a.apr)} annualized paper estimate`;
     $("cFunding").textContent = signed(a.funding); $("cFunding").className = cls(a.funding);
+    $("cFundingSub").textContent = `${a.unresolvedFundingPayments ?? 0} unresolved interval(s)${a.fundingAwaitingObservation ? "; awaiting observations" : ""}${a.historyComplete ? "" : "; legacy history incomplete"}`;
     $("cFees").textContent = money(a.fees);
     $("cOpen").textContent = `${c.positions.length} / ${c.config.maxPositions}`;
     $("cCash").textContent = `${money(a.cash)} free`;
     $("carryNote").innerHTML = !c.enabled ? "The funding carry is turned off in Settings." :
       c.error ? `<span class="warn">Coinbase futures data unavailable: ${esc(c.error)}. Retrying.</span>` :
-      "Paper only. Buy a coin on the cheapest exchange and short the same amount of its US perpetual future on Coinbase (Coinbase Financial Markets, CFTC-regulated). Price moves cancel out; while the future trades above spot, the short collects the hourly funding that longs pay. " +
-      `Each position ties up the coins plus ${c.config.marginBuffer}% of the short as collateral.`;
+      "Paper carry estimates only. Holding spot and short futures can reduce price exposure, but basis, fees, funding and margin still affect results. Public rates do not supply the required settlement-time futures mark, so funding amounts remain unresolved. " +
+      `Each position ties up spot plus ${c.config.marginBuffer}% short collateral. Unknown funding is excluded, not assumed zero.${a.legacyFundingEstimate ? ` Legacy unverified funding removed from confirmed totals: ${signed(a.legacyFundingEstimate)}.` : ""}`;
     rows("cPositions", c.positions, (p) => {
       const m = p.mark;
       return `<tr><td><strong>${esc(p.coin)}</strong><br><span class="muted">${esc(p.perpId)}</span></td>` +
         `<td>${p.contracts} contract${p.contracts === 1 ? "" : "s"} short<br><span class="muted">${p.spotQty.toLocaleString("en-US", { maximumFractionDigits: 6 })} ${esc(p.coin)} on ${esc(p.spotVenue)}</span></td>` +
-        `<td class="num">${hoursText(p.hours)}<br><span class="muted">${p.fundingPayments} payment${p.fundingPayments === 1 ? "" : "s"}</span></td>` +
+        `<td class="num">${hoursText(p.hours)}<br><span class="muted">${p.unresolvedFundingPayments ?? 0} unresolved interval(s)</span></td>` +
         `<td class="num ${cls(p.funding)}">${signed(p.funding)}</td>` +
         `<td class="num ${m ? cls(m.spotPnl + m.shortPnl) : "muted"}">${m ? signed(m.spotPnl + m.shortPnl) : "—"}</td>` +
         `<td class="num muted">${money(p.fees + (m ? m.exitFees : 0), 2)}</td>` +
-        `<td class="num ${m ? cls(m.net) : "muted"}">${m ? signed(m.net) : "waiting for prices"}</td>` +
-        `<td class="num ${!m ? "muted" : m.riseToMarginCall < 0.25 ? "neg" : m.riseToMarginCall < 0.5 ? "warn" : "pos"}">${m ? "+" + (m.riseToMarginCall * 100).toFixed(0) + "%" : "—"}</td></tr>`;
+        `<td class="num ${m ? cls(m.net) : "muted"}">${m ? signed(m.net) : "Unavailable"}<br><span class="${p.valuationComplete ? "muted" : "warn"}">${p.markStale ? `Last known ${p.markAt ? ago(s.now - p.markAt) : "mark"}` : p.exitBlocked ? esc(p.exitBlocked) : "Paper exit estimate"}${p.unresolvedFundingPayments ? "; funding incomplete" : ""}</span></td>` +
+        `<td class="num ${!m ? "muted" : m.riseToMarginCall < 0.25 ? "neg" : m.riseToMarginCall < 0.5 ? "warn" : "pos"}">${m ? pct(m.riseToMarginCall * 100) : "—"}</td></tr>`;
     }, 8, c.enabled ? "No carry positions yet. One opens when a contract's expected return clears your minimum, after at least 6 hours of funding history." : "Turned off.");
     rows("cPerps", c.perps, (r) => {
       const q = r.quote, net = q ? q.netAprOnCapital : null;
@@ -476,7 +546,7 @@
         `<td class="num ${cls(r.lastApr)}">${apr(r.lastApr)}</td><td class="num ${cls(r.trailingApr)}">${r.trailingApr === null ? `<span class="muted">${r.samples}/6 h</span>` : apr(r.trailingApr)}</td>` +
         `<td class="num ${net === null ? "muted" : net >= c.config.minNetApr / 100 ? "pos" : net > 0 ? "warn" : "neg"}">${apr(net)}</td>` +
         `<td class="num muted">${q && q.contracts ? money(q.capital, 0) : "—"}</td><td class="wrap ${status}">${esc(r.reason || "")}</td></tr>`;
-    }, 10, c.enabled ? (c.error ? "Coinbase futures data unavailable." : "Loading Coinbase's futures…") : "Turned off.");
+    }, 9, c.enabled ? (c.error ? "Coinbase futures data unavailable." : "Loading Coinbase's futures…") : "Turned off.");
     rows("cDated", c.dated, (d) => `<tr><td><strong>${esc(d.coin)}</strong></td><td class="muted">${esc(d.id)}</td><td class="num">${d.days.toFixed(0)}</td>` +
       `<td class="num ${d.basisPct === null ? "muted" : cls(d.basisPct)}">${d.basisPct === null ? "—" : pct(d.basisPct)}</td>` +
       `<td class="num ${d.netPct === null ? "muted" : cls(d.netPct)}">${d.netPct === null ? "—" : pct(d.netPct)}</td>` +
@@ -528,14 +598,14 @@
     // The last 24 clock hours, empty where the engine wasn't running.
     const byHour = new Map(hourRows(s).map((h) => [Date.parse(h.hour), h])), now = Date.parse(s.currentHour.hour);
     const hours = Array.from({ length: 24 }, (_, i) => { const t = now - (23 - i) * 3_600_000;
-      return byHour.get(t) || { hour: new Date(t).toISOString(), trades: 0, pnl: 0, shadow: { expected: 0, realized: 0, absError: 0, filled: 0, partial: 0, missed: 0, losses: 0 } }; });
+      return byHour.get(t) || { hour: new Date(t).toISOString(), trades: 0, pnl: 0, shadow: { expected: 0, realized: null, absError: 0, filled: 0, partial: 0, missed: 0, losses: 0, unresolved: 0 } }; });
     const anyReplays = hours.some((h) => replays(h.shadow));
 
     chart($("chartOutcomes"), "Share of replayed trades by outcome, per hour", anyReplays ? "" : "No trades replayed yet.", (w) => {
       const range = nice(0, 100), y = yScale(range), bw = (w - P.l - P.r) / hours.length, points = [];
       let bars = "";
       hours.forEach((h, i) => {
-        const t = h.shadow, n = replays(t), x = P.l + bw * i;
+        const t = h.shadow, n = replays(t), completed = n - (t.unresolved ?? n), x = P.l + bw * i;
         if (!n) return;
         let base = 0;
         for (const [key, c] of [["filled", "b-filled"], ["partial", "b-partial"], ["missed", "b-missed"]]) {
@@ -543,30 +613,30 @@
           if (part) bars += `<rect class="${c}" x="${f1(x + bw * 0.15)}" y="${f1(y(base + part))}" width="${f1(bw * 0.7)}" height="${f1(y(base) - y(base + part))}"/>`;
           base += part;
         }
-        points.push([x + bw * 0.5, y((t.losses / n) * 100)]);
-        bars += hit(x, bw, `${hourLabel(h.hour)}: ${n} replayed · ${t.filled} filled · ${t.partial} one side only · ${t.missed} missed · ${t.losses} turned a loss (${share(((t.partial + t.missed) / n) * 100)} didn't work)`);
+        if (completed > 0) points.push([x + bw * 0.5, y((t.losses / completed) * 100)]);
+        bars += hit(x, bw, `${hourLabel(h.hour)}: ${n} replayed · ${t.filled} filled · ${t.partial} partial execution · ${t.missed} missed · ${t.losses} turned a loss (${share(((t.partial + t.missed) / n) * 100)} didn't work)`);
       });
       const line = points.length > 1 ? `<polyline class="loss-line" points="${points.map(([px, py]) => `${f1(px)},${f1(py)}`).join(" ")}"/>` : "";
       return yGrid(w, range, y, (v) => v.toFixed(0) + "%") + bars + line + points.map(([px, py]) => `<circle class="loss-dot" cx="${f1(px)}" cy="${f1(py)}" r="3"/>`).join("") +
         xLabels(w, hours.map((h) => hourLabel(h.hour)));
     });
 
-    chart($("chartProfit"), "Paper and realistic profit per hour", hours.some((h) => h.trades) ? "" : "No paper trades yet.", (w) => {
-      const values = hours.flatMap((h) => [h.pnl, h.shadow.realized]);
+    chart($("chartProfit"), "Paper and simulated execution profit per hour", hours.some((h) => h.trades) ? "" : "No paper trades yet.", (w) => {
+      const values = hours.flatMap((h) => [h.pnl, h.shadow.realized]).filter(finite);
       const range = nice(Math.min(0, ...values), Math.max(0, ...values)), y = yScale(range), bw = (w - P.l - P.r) / hours.length, zero = y(0);
-      const bar = (value, x, width, c) => `<rect class="${c}" x="${f1(x)}" y="${f1(Math.min(y(value), zero))}" width="${f1(width)}" height="${f1(Math.max(Math.abs(y(value) - zero), value ? 1 : 0))}"/>`;
+      const bar = (value, x, width, c) => !finite(value) ? "" : `<rect class="${c}" x="${f1(x)}" y="${f1(Math.min(y(value), zero))}" width="${f1(width)}" height="${f1(Math.max(Math.abs(y(value) - zero), value ? 1 : 0))}"/>`;
       const bars = hours.map((h, i) => {
         const x = P.l + bw * i;
         return bar(h.pnl, x + bw * 0.12, bw * 0.36, "b-paper") + bar(h.shadow.realized, x + bw * 0.52, bw * 0.36, h.shadow.realized >= 0 ? "b-real" : "b-loss") +
-          hit(x, bw, `${hourLabel(h.hour)}: paper ${signed(h.pnl)} · realistic ${signed(h.shadow.realized)} · ${h.trades} trades`);
+          hit(x, bw, `${hourLabel(h.hour)}: paper ${signed(h.pnl)} · simulated execution ${signed(h.shadow.realized)} · ${h.trades} trades`);
       }).join("");
       return yGrid(w, range, y, moneyAxis(range.step)) + `<line class="zero" x1="${P.l}" x2="${w - P.r}" y1="${f1(zero)}" y2="${f1(zero)}"/>` + bars +
         xLabels(w, hours.map((h) => hourLabel(h.hour)));
     });
 
     const bins = s.accuracy.errorBins;
-    $("errorNote").textContent = `Realistic minus paper net for the latest ${s.accuracy.errorSample || ""} replays. Left of zero: the paper estimate was too optimistic.`;
-    chart($("chartErrors"), "Distribution of realistic minus paper net per trade", bins.length ? "" : "No trades replayed yet.", (w) => {
+    $("errorNote").textContent = `Simulated execution minus paper net for the latest ${s.accuracy.errorSample || ""} complete simulations; unresolved results are excluded. Left of zero: the paper estimate was too optimistic.`;
+    chart($("chartErrors"), "Distribution of simulated execution minus paper net per trade", bins.length ? "" : "No trades replayed yet.", (w) => {
       const range = nice(0, Math.max(...bins.map((b) => b.count)), 1), y = yScale(range);
       const from = bins[0].from, to = bins[bins.length - 1].to, x = (v) => P.l + ((v - from) / (to - from)) * (w - P.l - P.r);
       const step = bins[0].to - bins[0].from, fmt = moneyAxis(step);
@@ -583,19 +653,24 @@
   async function refresh() {
     let s;
     try { const r = await fetch("/api/state", { cache: "no-store" }); if (!r.ok) throw new Error(); s = await r.json(); }
-    catch { $("state").className = "pill offline"; $("state").textContent = "ENGINE STOPPED"; $("toggle").disabled = $("reset").disabled = true; return; }
+    catch { $("state").className = "pill offline"; $("state").textContent = "ENGINE STOPPED"; $("toggle").disabled = $("reset").disabled = $("inventorySubmit").disabled = true; return; }
     last = s; running = s.running;
+    $("auditError").hidden = !s.auditError;
+    $("auditError").textContent = s.auditError ? `Trading paused: audit storage is unavailable. ${s.auditError}` : "";
+    $("legacyNote").hidden = !s.session.legacyEstimate;
+    $("legacyNote").textContent = s.session.legacyEstimate ? `Legacy results were estimates without complete execution evidence (${s.session.legacyEstimate.tradeCount} trades; former balance ${money(s.session.legacyEstimate.balance)}). They are kept separately and are not verified profit.` : "";
     $("state").className = "pill " + (!s.ready ? "paused" : s.running ? "running" : "paused");
     $("state").textContent = !s.ready ? "STARTING" : s.running ? "RUNNING" : "PAUSED";
-    $("toggle").disabled = $("reset").disabled = !s.ready;
+    $("reset").disabled = !s.ready; $("toggle").disabled = !s.ready || !!s.auditError;
     $("toggle").textContent = s.running ? "Pause" : "Resume";
     const cov = s.coverage, rate = (c) => s.rates[c] ? `${c} $${s.rates[c].mid.toFixed(4)}` : `${c} —`;
     $("coverage").innerHTML = !s.ready ? "Finding markets on each exchange…" :
       `<span><strong>${cov.coins}</strong> coins</span><span><strong>${cov.markets.toLocaleString()}</strong> order books</span>` +
       `<span><strong>${s.feeds.length}</strong> exchanges</span><span>${rate("USDT")} · ${rate("USDC")}</span>` +
-      (s.reaction.medianMs === null ? "" : `<span title="Time from a price change arriving to a trade decision, over the last ${s.reaction.samples} changes; then building and signing the orders">Reacts in <strong>${s.reaction.medianMs < 0.1 ? "<0.1" : s.reaction.medianMs.toFixed(1)} ms</strong> (95% within ${s.reaction.p95Ms.toFixed(1)} ms) · orders ready in ${s.orderPrepMs.toFixed(2)} ms</span>`) +
+      (s.reaction.medianMs === null ? "" : `<span title="Time from a price change arriving to a trade decision, over the last ${s.reaction.samples} changes; then building and signing the orders">Reacts in <strong>${s.reaction.medianMs < 0.1 ? "<0.1" : s.reaction.medianMs.toFixed(1)} ms</strong> (95% within ${s.reaction.p95Ms.toFixed(1)} ms) · order preparation benchmark ${s.orderPrepMs.toFixed(2)} ms</span>`) +
       (cov.source !== "live" ? `<span class="warn">Using ${cov.source === "cache" ? "saved" : "built-in"} listings</span>` : "");
     renderOverview(s);
+    renderInventory(s);
     renderTrades(s);
     renderAccuracy(s);
     renderCarry(s);
@@ -604,10 +679,29 @@
 
   async function post(path, body) {
     const r = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json", "X-Arbiter": "1" }, body: JSON.stringify(body || {}) });
-    return r.json().catch(() => ({}));
+    const data = await r.json().catch(() => ({}));
+    return r.ok ? data : { ...data, error: data.error || `Request failed (HTTP ${r.status})` };
   }
+  $("inventoryMarket").addEventListener("change", () => { inventoryQuote(); if (last) renderInventory(last); });
+  $("inventorySide").addEventListener("change", inventoryQuote);
+  $("inventoryForm").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (inventoryBusy) return;
+    const quantity = Number($("inventoryQuantity").value);
+    if (!$("inventoryMarket").value) { $("inventoryResult").textContent = "Select a fresh USD market."; return; }
+    if (!Number.isFinite(quantity) || quantity <= 0) { $("inventoryResult").textContent = "Enter a positive coin quantity."; $("inventoryResult").className = "neg"; return; }
+    inventoryBusy = true; $("inventorySubmit").disabled = true;
+    $("inventoryResult").textContent = "Simulating inventory trade…"; $("inventoryResult").className = "muted";
+    try {
+      const result = await post("/api/inventory", { market: $("inventoryMarket").value, side: $("inventorySide").value, quantity });
+      if (result.error) throw new Error(result.error);
+      $("inventoryResult").textContent = result.fill ? `Simulated ${units(result.fill.filledQty)} coin(s) at ${money(result.fill.price, result.fill.price < 1 ? 8 : 2)}. Fees and balances are recorded.` : "Inventory request recorded. Refreshing balances.";
+      $("inventoryResult").className = "pos";
+    } catch (error) { $("inventoryResult").textContent = error.message || "Could not simulate the inventory trade."; $("inventoryResult").className = "neg"; }
+    finally { inventoryBusy = false; await refresh(); }
+  });
   $("toggle").onclick = async () => { await post("/api/running", { running: !running }); refresh(); };
-  $("reset").onclick = async () => { if (confirm("Reset the paper session? Paper and realistic balances return to the starting amount and the accuracy figures start over; the old logs are archived, not deleted.")) { await post("/api/reset"); refresh(); } };
+  $("reset").onclick = async () => { if (confirm("Reset the paper session? Paper balances return to starting USD distributed across venues and the accuracy figures start over; the old logs are archived, not deleted.")) { await post("/api/reset"); refresh(); } };
   $("suspects").addEventListener("click", async (event) => {
     const verify = event.target.closest("[data-verify]");
     if (verify) {

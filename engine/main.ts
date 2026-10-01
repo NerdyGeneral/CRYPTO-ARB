@@ -143,8 +143,16 @@ const server = http.createServer(async (request, response) => {
       const verdict = await engine.verifyRoute(body.key);
       return send(verdict ? 200 : 409, "application/json", JSON.stringify(verdict ? { verdict } : { error: "Route is no longer a suspect, or a check is already running" }));
     }
+    if (path === "/api/inventory") {
+      const body = await readBody(request) as {market?:unknown; side?:unknown; quantity?:unknown};
+      if (typeof body.market !== "string" || !["buy","sell"].includes(String(body.side)) || typeof body.quantity !== "number")
+        return send(400,"application/json",JSON.stringify({error:"market, side and quantity are required"}));
+      try { return send(200,"application/json",JSON.stringify(await engine.tradeInventory(body.market,body.side as "buy"|"sell",body.quantity))); }
+      catch (error) { return send(409,"application/json",JSON.stringify({error:error instanceof Error ? error.message : String(error)})); }
+    }
     if (path === "/api/reset") {
-      engine.resetSession();
+      try { await engine.resetSession(); }
+      catch (error) { return send(500,"application/json",JSON.stringify({error:error instanceof Error ? error.message : String(error)})); }
       console.log(`${new Date().toLocaleTimeString()}  Paper session reset; previous logs archived`);
       return send(200, "application/json", '{"ok":true}');
     }
@@ -166,16 +174,23 @@ server.listen(config.port, "127.0.0.1", async () => {
   const releaseHelper = windowsHelper();
   void syncAutostart(engine.currentConfig.startWithWindows);
   let stopping = false;
-  const shutdown = (signal: string) => {
+  const shutdown = async (signal: string) => {
     if (stopping) return;
     stopping = true;
     console.log(`\n${signal}: saving paper session and stopping.`);
-    engine.stop();
-    releaseHelper();
-    server.close();
-    process.exit(0);
+    try {
+      await engine.stop();
+      releaseHelper();
+      server.close();
+      process.exit(0);
+    } catch (error) {
+      console.error("Failed to flush audit data during shutdown:", error);
+      releaseHelper();
+      server.close();
+      process.exit(1);
+    }
   };
-  for (const signal of ["SIGINT", "SIGTERM", "SIGHUP", "SIGBREAK"] as const) process.on(signal, () => shutdown(signal));
+  for (const signal of ["SIGINT", "SIGTERM", "SIGHUP", "SIGBREAK"] as const) process.on(signal, () => { void shutdown(signal); });
 
   console.log("\n  ARBITER / LIVE — paper trading engine\n  Simulated trades only. No orders are sent to any exchange.\n\n  Finding markets on each exchange…");
   openBrowser();

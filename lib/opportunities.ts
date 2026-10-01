@@ -1,17 +1,16 @@
-import { feeKey, type Quote, type Settings, type Venue } from "./market";
+import { feeKey, quoteFresh, type Quote, type Settings, type Venue } from "./market";
 import { dollarStablecoins, isDollarStable, keyOf, type Market } from "./markets";
 
 // Route math for the background engine. Every opportunity is valued in USD, paying the taker fee on
 // every leg and the price-movement buffer per leg, and is sized to the top of each order book.
 //
 // - cross:    buy a coin on one venue and sell it on another. Either side may be priced in USD, USDT or
-//             USDC; a stablecoin leg is valued at that venue's live stablecoin/USD book (or the median
-//             across venues) including the cost of converting.
+//             USDC; a stablecoin leg requires that venue's fresh stablecoin/USD book, including conversion
+//             fees and available conversion depth. Cross-venue median rates are reporting-only.
 // - triangle: USD -> A -> B -> USD on a single venue, e.g. USD -> BTC -> ETH -> USD or USD -> USDT -> SOL -> USD.
 
 export const QUOTE_TTL_MS = 12_000;
 export const MAX_LEG_SKEW_MS = 4_000;
-const RATE_TTL_MS = 60_000;
 const MIN_NOTIONAL = 5;
 
 // `market` and `size` identify the exact top-of-book quote a leg would trade against; `qty` is the order size
@@ -31,9 +30,13 @@ export type ScanInput = {
   balance: number; now: number; triangular: boolean;
   // Which routes each market takes part in; built from `markets` when not given.
   index?: RouteIndex;
+  // Normalize quantities and constrain funding before ranking execution candidates. Display values remain raw.
+  prepare?: (opportunity: Opportunity) => Opportunity | null;
+  // Execution selection is independent of the dashboard's top-20 display limit.
+  eligible?: (opportunity: Opportunity) => boolean;
 };
 export type ScanResult = {
-  top: Opportunity[]; suspects: Opportunity[]; best: Opportunity | null; rates: Record<string, Rate>;
+  top: Opportunity[]; suspects: Opportunity[]; best: Opportunity | null; bestEligible: Opportunity | null; rates: Record<string, Rate>;
   evaluated: { cross: number; triangle: number };
 };
 
@@ -61,6 +64,8 @@ type Triangle = { venue: Venue; steps: [Step, Step, Step] };
 export type RouteIndex = {
   stable: Market[];
   crossByCoin: Map<string, Market[]>;
+  // Local stablecoin/USD books affect all coin books quoted in that currency on the same venue.
+  crossByConversion: Map<string, Market[]>;
   triangles: Triangle[];
   trianglesByMarket: Map<string, Triangle[]>;
 };
@@ -71,6 +76,12 @@ export function indexRoutes(markets: Market[]): RouteIndex {
   for (const m of markets) {
     if (!(m.quote === "USD" || isDollarStable(m.quote)) || isDollarStable(m.base)) continue;
     crossByCoin.set(m.base, [...(crossByCoin.get(m.base) || []), m]);
+  }
+  const crossByConversion = new Map<string, Market[]>();
+  for (const books of crossByCoin.values()) for (const m of books) {
+    if (!isDollarStable(m.quote)) continue;
+    const key = `${m.venue}|${m.quote}/USD`;
+    crossByConversion.set(key, [...(crossByConversion.get(key) || []), m]);
   }
   const triangles: Triangle[] = [];
   const byVenue = new Map<Venue, Market[]>();
@@ -90,10 +101,13 @@ export function indexRoutes(markets: Market[]): RouteIndex {
   const trianglesByMarket = new Map<string, Triangle[]>();
   for (const t of triangles) for (const key of new Set(t.steps.map((step) => keyOf(step.m))))
     trianglesByMarket.set(key, [...(trianglesByMarket.get(key) || []), t]);
-  return { stable, crossByCoin, triangles, trianglesByMarket };
+  return { stable, crossByCoin, crossByConversion, triangles, trianglesByMarket };
 }
 
-type Entry = { m: Market; q: Quote; mid: number; cost: number; value: number; fee: number; at: number };
+type Entry = {
+  m: Market; q: Quote; mid: number; cost: number; value: number; fee: number; at: number; latestAt: number;
+  buyCapacity: number; sellCapacity: number;
+};
 
 // Everything a route's value depends on besides its own books: fees, the buffer, the budget and each
 // stablecoin's live dollar value.
@@ -105,13 +119,17 @@ function valuation(input: ScanInput, index: RouteIndex) {
   // Stablecoin/USD and stablecoin/stablecoin books use the venue's stablecoin schedule when it is cheaper.
   const pairFee = (m: Market) => isDollarStable(m.base) && (m.quote === "USD" || isDollarStable(m.quote))
     ? Math.min(taker(m.venue), input.conversionFee / 100) : taker(m.venue);
-  const fresh = (m: Market, ttl = QUOTE_TTL_MS) => { const q = quotes.get(keyOf(m)); return q && now - q.receivedAt <= ttl ? q : undefined; };
+  const fresh = (m: Market) => {
+    const q = quotes.get(keyOf(m));
+    return q && quoteFresh(q, now, QUOTE_TTL_MS)
+      && [q.bid, q.bidSize, q.ask, q.askSize].every((n) => Number.isFinite(n) && n > 0) && q.ask >= q.bid ? q : undefined;
+  };
 
   // Live dollar value of each stablecoin, per venue and as a cross-venue median.
   const stableBooks = new Map<string, { market: Market; quote: Quote }>();
   const rates: Record<string, Rate> = {};
   for (const coin of dollarStablecoins) {
-    const books = index.stable.filter((m) => m.base === coin).flatMap((m) => { const q = fresh(m, RATE_TTL_MS); return q ? [{ market: m, quote: q }] : []; });
+    const books = index.stable.filter((m) => m.base === coin).flatMap((m) => { const q = fresh(m); return q ? [{ market: m, quote: q }] : []; });
     for (const book of books) stableBooks.set(`${book.market.venue}|${coin}`, book);
     if (books.length) rates[coin] = {
       mid: median(books.map((b) => (b.quote.bid + b.quote.ask) / 2)), bid: median(books.map((b) => b.quote.bid)),
@@ -120,30 +138,35 @@ function valuation(input: ScanInput, index: RouteIndex) {
   }
   // USD value of one unit of `currency` on `venue`: mid for reporting, ask/bid after conversion cost.
   const dollar = (venue: Venue, currency: string) => {
-    if (currency === "USD") return { mid: 1, buy: 1, sell: 1, at: now };
+    if (currency === "USD") return { mid: 1, buy: 1, sell: 1, at: null, buyCapacity: Infinity, sellCapacity: Infinity };
     const book = stableBooks.get(`${venue}|${currency}`);
     if (book) {
       const fee = pairFee(book.market);
-      return { mid: (book.quote.bid + book.quote.ask) / 2, buy: book.quote.ask * (1 + fee), sell: book.quote.bid * (1 - fee), at: book.quote.receivedAt };
+      return { mid: (book.quote.bid + book.quote.ask) / 2, buy: book.quote.ask * (1 + fee), sell: book.quote.bid * (1 - fee),
+        at: book.quote.receivedAt, buyCapacity: book.quote.askSize, sellCapacity: book.quote.bidSize };
     }
-    const ref = rates[currency];
-    return ref ? { mid: ref.mid, buy: ref.mid * (1 + input.conversionFee / 100), sell: ref.mid * (1 - input.conversionFee / 100), at: now } : null;
+    // Another exchange's median cannot execute this venue's currency conversion.
+    return null;
   };
   const entries = (coin: string): Entry[] => (index.crossByCoin.get(coin) || []).flatMap((m) => {
     const q = fresh(m);
     const d = q && dollar(m.venue, m.quote);
-    return q && d ? [{ m, q, mid: d.mid, cost: d.buy, value: d.sell, fee: taker(m.venue), at: Math.min(q.receivedAt, d.at) }] : [];
+    return q && d ? [{ m, q, mid: d.mid, cost: d.buy, value: d.sell, fee: taker(m.venue),
+      at: Math.min(q.receivedAt, d.at ?? q.receivedAt), latestAt: Math.max(q.receivedAt, d.at ?? q.receivedAt),
+      buyCapacity: d.buyCapacity, sellCapacity: d.sellCapacity }] : [];
   });
 
   // Buy on a's book, sell on b's.
   const cross = (coin: string, a: Entry, b: Entry): Opportunity | null => {
-    if (a.m.venue === b.m.venue || Math.abs(a.q.receivedAt - b.q.receivedAt) > MAX_LEG_SKEW_MS) return null;
+    if (a.m.venue === b.m.venue || Math.max(a.latestAt, b.latestAt) - Math.min(a.at, b.at) > MAX_LEG_SKEW_MS) return null;
     const askMid = a.q.ask * a.mid, bidMid = b.q.bid * b.mid;
-    const qty = Math.min(budget / (a.q.ask * a.cost * (1 + a.fee + slip)), a.q.askSize, b.q.bidSize);
+    const qty = Math.min(budget / (a.q.ask * a.cost * (1 + a.fee + slip)), a.q.askSize, b.q.bidSize,
+      a.buyCapacity / (a.q.ask * (1 + a.fee)), b.sellCapacity / (b.q.bid * (1 - b.fee)));
     if (!Number.isFinite(qty) || qty <= 0 || qty * askMid < MIN_NOTIONAL) return null;
     const grossPct = (bidMid / askMid - 1) * 100;
     const fees = qty * askMid * a.fee + qty * bidMid * b.fee;
-    const conversion = qty * a.q.ask * (a.cost - a.mid) + qty * b.q.bid * (b.mid - b.value);
+    // Convert the actual quote-currency spend/proceeds, including the trading fee on each leg.
+    const conversion = qty * a.q.ask * (1 + a.fee) * (a.cost - a.mid) + qty * b.q.bid * (1 - b.fee) * (b.mid - b.value);
     const buffer = qty * (askMid + bidMid) * slip;
     const net = qty * (bidMid - askMid) - fees - conversion - buffer;
     const notional = qty * askMid;
@@ -169,7 +192,7 @@ function valuation(input: ScanInput, index: RouteIndex) {
     const edges = t.steps.map((step, i) => {
       const q = qs[i], fee = pairFee(step.m);
       return step.side === "buy"
-        ? { ...step, q, fee, rate: (1 - fee) / q.ask, raw: 1 / q.ask, capacity: q.askSize * q.ask }
+        ? { ...step, q, fee, rate: 1 / (q.ask * (1 + fee)), raw: 1 / q.ask, capacity: q.askSize * q.ask * (1 + fee) }
         : { ...step, q, fee, rate: q.bid * (1 - fee), raw: q.bid, capacity: q.bidSize };
     });
     const [e1, e2, e3] = edges;
@@ -206,12 +229,18 @@ export function scanOpportunities(input: ScanInput): ScanResult {
   const top = new TopN(20, (o) => o.net);
   const suspects = new TopN(10, (o) => o.grossPct);
   let best: Opportunity | null = null;
+  let bestEligible: Opportunity | null = null;
   const evaluated = { cross: 0, triangle: 0 };
   const consider = (o: Opportunity | null) => {
     if (!o) return;
     if (o.suspect) { suspects.add(o); return; }
     top.add(o);
     if (!best || o.net > best.net) best = o;
+    // Funding, order increments, or repricing can change a route's rank. Prepare every candidate before
+    // comparing executable net profit, including candidates whose raw net is below the current leader.
+    const prepared = input.prepare ? input.prepare(o) : o;
+    if (prepared && !prepared.suspect && (!bestEligible || prepared.net > bestEligible.net)
+      && (!input.eligible || input.eligible(prepared))) bestEligible = prepared;
   };
   for (const coin of index.crossByCoin.keys()) {
     const entries = v.entries(coin);
@@ -226,26 +255,29 @@ export function scanOpportunities(input: ScanInput): ScanResult {
     if (o) evaluated.triangle++;
     consider(o);
   }
-  return { top: top.items, suspects: suspects.items, best, rates: v.rates, evaluated };
+  return { top: top.items, suspects: suspects.items, best, bestEligible, rates: v.rates, evaluated };
 }
 
-// Only the routes that use `market`, for reacting to one book's change without rescanning everything.
-// A stablecoin's own USD book moves every route priced in it, so it is left to the full scan.
+// Only routes affected by this book, including local stablecoin conversion dependencies.
 export function scanMarket(input: ScanInput, market: Market): Opportunity[] {
-  if (isDollarStable(market.base)) return [];
   const index = input.index || indexRoutes(input.markets);
   const v = valuation(input, index);
-  const found: Opportunity[] = [];
+  const found = new Map<string, Opportunity>();
   const key = keyOf(market);
-  if (market.quote === "USD" || isDollarStable(market.quote)) {
-    const entries = v.entries(market.base);
-    const own = entries.find((e) => keyOf(e.m) === key);
+  const affected = [...(index.crossByConversion.get(key) || [])];
+  if (!isDollarStable(market.base) && (market.quote === "USD" || isDollarStable(market.quote))) affected.push(market);
+  // Cache each coin's valuation once, even if a conversion affects multiple books for that coin.
+  const byCoin = new Map<string, Entry[]>();
+  for (const changed of affected) {
+    let entries = byCoin.get(changed.base);
+    if (!entries) { entries = v.entries(changed.base); byCoin.set(changed.base, entries); }
+    const own = entries.find((e) => keyOf(e.m) === keyOf(changed));
     if (own) for (const other of entries) {
-      for (const o of [v.cross(market.base, own, other), v.cross(market.base, other, own)]) if (o) found.push(o);
+      for (const o of [v.cross(changed.base, own, other), v.cross(changed.base, other, own)]) if (o) found.set(o.key, o);
     }
   }
-  if (input.triangular) for (const t of index.trianglesByMarket.get(key) || []) { const o = v.triangle(t); if (o) found.push(o); }
-  return found.sort((a, b) => b.net - a.net);
+  if (input.triangular) for (const t of index.trianglesByMarket.get(key) || []) { const o = v.triangle(t); if (o) found.set(o.key, o); }
+  return [...found.values()].sort((a, b) => b.net - a.net);
 }
 
 export type TradeMemory = {

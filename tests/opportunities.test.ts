@@ -36,7 +36,7 @@ test("a USDT leg is valued at the venue's USDT/USD book including conversion cos
   const fee = 0.0002, cost = 1.001 * (1 + fee);             // buying USDT back costs the ask plus Binance.US's fee
   const qty = 50 / (100 * cost * (1 + fee + 0.001));
   const fees = qty * 100 * fee + qty * 101 * 0.009;
-  const conversion = qty * 100 * (cost - 1);
+  const conversion = qty * 100 * (1 + fee) * (cost - 1);
   const buffer = qty * (100 + 101) * 0.001;
   close(route.net, qty * (101 - 100) - fees - conversion - buffer);
   close(route.conversion, conversion);
@@ -54,7 +54,7 @@ test("triangles are priced with three taker fees and a buffer per leg, in both d
   const forward = result.top.concat(result.suspects).find((o) => o.path === "Kraken: USD → BTC → ETH → USD")!;
   const raw = (1 / 100) * (1 / 0.05) * 5.2;
   close(forward.grossPct, (raw - 1) * 100);
-  close(forward.net, 50 * raw * (1 - fee) ** 3 * (1 - slip) ** 3 - 50);
+  close(forward.net, 50 * raw * (1 - fee) / (1 + fee) ** 2 * (1 - slip) ** 3 - 50);
   assert.equal(forward.legs.map((l) => `${l.side} ${l.pair}`).join(", "), "buy BTC/USD, buy ETH/BTC, sell ETH/USD");
   const reverse = result.top.find((o) => o.path === "Kraken: USD → ETH → BTC → USD")!;
   close(reverse.grossPct, ((1 / 5.21) * 0.0499 * 99.9 - 1) * 100);
@@ -165,7 +165,6 @@ test("re-checking only the routes that use a changed book finds exactly what a f
     // Each route the full scan found is found, with the same value, when any one of its books changes.
     for (const leg of o.legs) {
       const market = input.markets.find((m) => keyOf(m) === leg.market)!;
-      if (market.base === "USDT") continue; // stablecoin books are left to the full scan
       const match = scanMarket({ ...input, index }, market).find((x) => x.key === o.key);
       assert.ok(match, `${o.key} missing when ${leg.market} changes`);
       close(match!.net, o.net);
@@ -174,4 +173,129 @@ test("re-checking only the routes that use a changed book finds exactly what a f
   // And nothing it returns involves only other books.
   const market = input.markets.find((m) => keyOf(m) === "Kraken|SOL/BTC")!;
   for (const o of scanMarket({ ...input, index }, market)) assert.ok(o.legs.some((leg) => leg.market === "Kraken|SOL/BTC"), o.key);
+});
+
+
+test("the best eligible route is selected even when it ranks below the displayed top 20", () => {
+  const entries: [Market, Quote][] = [];
+  for (let i = 0; i < 25; i++) {
+    const coin = `COIN${i}`;
+    entries.push([makeMarket("Coinbase", coin, "USD"), quote(99.9, 100)]);
+    entries.push([makeMarket("Kraken", coin, "USD"), quote(103 - i * 0.01, 103.1 - i * 0.01)]);
+  }
+  const result = scan(entries, { triangular: false, eligible: (o) => o.coin === "COIN24" && o.venues[0] === "Coinbase" });
+  assert.equal(result.top.length, 20);
+  assert.ok(result.top.every((o) => o.coin !== "COIN24"));
+  assert.equal(result.bestEligible?.coin, "COIN24");
+  assert.equal(result.bestEligible?.venues[0], "Coinbase");
+  assert.ok(result.bestEligible!.net > 0);
+});
+
+test("stablecoin book updates immediately rescan every locally dependent cross route and triangle", () => {
+  const stable = makeMarket("Kraken", "USDT", "USD");
+  const entries: [Market, Quote][] = [
+    [stable, quote(0.999, 1.001)],
+    [makeMarket("Kraken", "BTC", "USDT"), quote(99.9, 100)],
+    [makeMarket("Kraken", "BTC", "USD"), quote(102, 102.1)],
+    [makeMarket("Coinbase", "BTC", "USD"), quote(102, 102.1)],
+    [makeMarket("Kraken", "ETH", "USDT"), quote(9.99, 10)],
+    [makeMarket("Coinbase", "ETH", "USD"), quote(10.2, 10.21)],
+  ];
+  const input = { ...book(entries), settings, conversionFee: 0.2, balance: 500, now, triangular: true };
+  const index = indexRoutes(input.markets);
+  const changed = scanMarket({ ...input, index }, stable);
+  assert.ok(changed.some((o) => o.kind === "cross" && o.coin === "BTC"));
+  assert.ok(changed.some((o) => o.kind === "cross" && o.coin === "ETH"));
+  assert.ok(changed.some((o) => o.kind === "triangle"));
+  assert.equal(new Set(changed.map((o) => o.key)).size, changed.length);
+  const full = scanOpportunities({ ...input, index });
+  for (const o of changed) close(full.top.find((candidate) => candidate.key === o.key)!.net, o.net);
+});
+
+test("a cross route cannot borrow another venue's stablecoin conversion book", () => {
+  const entries: [Market, Quote][] = [
+    [makeMarket("Binance.US", "BTC", "USDT"), quote(99.9, 100)],
+    [makeMarket("Kraken", "USDT", "USD"), quote(0.999, 1.001)],
+    [makeMarket("Coinbase", "BTC", "USD"), quote(102, 102.1)],
+  ];
+  assert.equal(scan(entries, { triangular: false }).top.length, 0);
+  entries.push([makeMarket("Binance.US", "USDT", "USD"), quote(0.999, 1.001, 1000, now - 13_000)]);
+  assert.equal(scan(entries, { triangular: false }).top.length, 0, "old local rate cannot execute a fresh route");
+  entries[entries.length - 1][1] = quote(0.999, 1.001, 1000, now - 5_000);
+  assert.equal(scan(entries, { triangular: false }).top.length, 0, "conversion and coin quote skew is enforced");
+});
+
+test("cross route size cannot exceed conversion liquidity including coin fees", () => {
+  const entries: [Market, Quote][] = [
+    [makeMarket("Binance.US", "BTC", "USDT"), quote(99.9, 100)],
+    [makeMarket("Binance.US", "USDT", "USD"), quote(0.999, 1.001, 10)],
+    [makeMarket("Coinbase", "BTC", "USD"), quote(102, 102.1)],
+  ];
+  const result = scan(entries, { triangular: false });
+  const buyStable = result.top.find((o) => o.venues[0] === "Binance.US")!;
+  close(buyStable.legs[0].qty * 100 * (1 + settings.binanceUsFee / 100), 10);
+  const sellStable = result.top.find((o) => o.venues[1] === "Binance.US")!;
+  close(sellStable.legs[1].qty * 99.9 * (1 - settings.binanceUsFee / 100), 10);
+});
+
+test("triangle buys pay quote-currency fees without phantom intermediate balances", () => {
+  const result = scan([
+    [makeMarket("Kraken", "BTC", "USD"), quote(99.9, 100, 0.2)],
+    [makeMarket("Kraken", "ETH", "BTC"), quote(0.0499, 0.05)],
+    [makeMarket("Kraken", "ETH", "USD"), quote(5.2, 5.21)],
+  ], { settings: { ...settings, buffer: 0 } });
+  const route = result.top.find((o) => o.path === "Kraken: USD → BTC → ETH → USD")!;
+  const [first, second, third] = route.legs;
+  close(first.qty, 0.2);
+  close(first.qty * first.price * (1 + first.fee), route.notional);
+  close(second.qty * second.price * (1 + second.fee), first.qty);
+  close(third.qty, second.qty);
+  close(third.qty * third.price * (1 - third.fee) - route.notional, route.net);
+});
+
+
+test("recent receipts cannot revive stale exchange events or long-running REST requests", () => {
+  const cb = makeMarket("Coinbase", "BTC", "USD"), kr = makeMarket("Kraken", "BTC", "USD");
+  for (const provenance of [{ receivedAt: now + 1 }, { exchangeAt: now - 30_000 }, { requestStartedAt: now - 13_000 }]) {
+    const result = scan([[cb, { ...quote(99.9, 100), ...provenance }], [kr, quote(102, 102.1)]], { triangular: false });
+    assert.equal(result.top.length, 0);
+  }
+});
+
+
+test("execution ranks funded profit while the display retains each raw opportunity", () => {
+  const entries: [Market, Quote][] = [
+    [makeMarket("Coinbase", "A", "USD"), quote(99.9, 100)],
+    [makeMarket("Kraken", "A", "USD"), quote(120, 120.1)],
+    [makeMarket("Coinbase", "B", "USD"), quote(99.9, 100)],
+    [makeMarket("Kraken", "B", "USD"), quote(110, 110.1)],
+  ];
+  const eligibleSaw: Opportunity[] = [];
+  const result = scan(entries, {
+    triangular: false, settings: { ...settings, coinbaseFee: 0, krakenFee: 0, buffer: 0, maxGap: 50 },
+    prepare: (o) => o.net <= 0 ? null : o.coin === "A" ? { ...o, net: 0.1, notional: 0.5 } : o,
+    eligible: (o) => { eligibleSaw.push(o); return true; },
+  });
+  assert.equal(result.best?.coin, "A");
+  close(result.best!.net, 10);
+  close(result.top[0].net, 10);
+  assert.equal(result.bestEligible?.coin, "B");
+  close(result.bestEligible!.net, 5);
+  assert.equal(eligibleSaw.find((o) => o.coin === "A")?.net, 0.1, "eligibility sees prepared funding");
+});
+
+test("preparation runs even when raw profit is below the current executable leader", () => {
+  const entries: [Market, Quote][] = [
+    [makeMarket("Coinbase", "A", "USD"), quote(99.9, 100)],
+    [makeMarket("Kraken", "A", "USD"), quote(120, 120.1)],
+    [makeMarket("Coinbase", "B", "USD"), quote(99.9, 100)],
+    [makeMarket("Kraken", "B", "USD"), quote(101, 101.1)],
+  ];
+  const result = scan(entries, {
+    triangular: false, settings: { ...settings, coinbaseFee: 0, krakenFee: 0, buffer: 0, maxGap: 50 },
+    prepare: (o) => o.net <= 0 ? null : { ...o, net: o.coin === "A" ? 1 : 2 },
+  });
+  assert.equal(result.best?.coin, "A");
+  assert.equal(result.bestEligible?.coin, "B");
+  assert.equal(result.bestEligible?.net, 2);
 });

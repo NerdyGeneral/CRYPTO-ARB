@@ -1,69 +1,137 @@
-import type { Quote } from "./market";
+import type { Quote, Venue } from "./market";
 import { isDollarStable } from "./markets";
 import type { Leg, Opportunity } from "./opportunities";
 
-// Shadow execution: replays a paper trade as immediate-or-cancel limit orders against the order books as
-// they stood when the orders would actually have reached each exchange, one round trip after the decision.
-// A leg fills only if the book still offers its price (or better), up to the size shown at the top.
-// Whatever does not match up is unwound at the next available prices, so a one-sided fill shows its cost.
-
-export type LegFill = { leg: Leg; filledQty: number; price: number | null };
+// These are simulated executions against observed books, not exchange-confirmed fills.
+export type LegFill = { leg: Leg; filledQty: number; price: number | null; feeAmount: number; feeCurrency: string; book: Quote | null; observedAt: number };
 export type ShadowOutcome = "filled" | "partial" | "missed";
+export type AssetCashflow = { venue: Venue; currency: string; amount: number };
+export type Exposure = AssetCashflow & { reason: string };
+export type ConversionBook = { market: string; quote: Quote; fee: number };
 export type ShadowResult = {
-  outcome: ShadowOutcome; expectedNet: number; realizedNet: number; filledFraction: number;
-  unwound: string[]; fills: LegFill[];
+  execution: "simulated";
+  outcome: ShadowOutcome; expectedNet: number; realizedNet: number | null; filledFraction: number;
+  // An incomplete result's USD cash flow is NOT profit: unresolved assets still have value or liabilities.
+  knownNet: number; accountingComplete: boolean;
+  unwound: string[]; fills: LegFill[]; unwindFills: LegFill[]; conversionFills: LegFill[];
+  cashflows: AssetCashflow[]; unresolved: Exposure[];
 };
 
-const FULL = 0.999;
+const FULL = 1 - 1e-12;
+const EPS = 1e-12;
 
 export function fillLeg(leg: Leg, book: Quote | undefined): LegFill {
-  if (!book) return { leg, filledQty: 0, price: null };
-  if (leg.side === "buy") {
-    if (book.ask > leg.price) return { leg, filledQty: 0, price: null };
-    return { leg, filledQty: Math.min(leg.qty, book.askSize), price: book.ask };
-  }
-  if (book.bid < leg.price) return { leg, filledQty: 0, price: null };
-  return { leg, filledQty: Math.min(leg.qty, book.bidSize), price: book.bid };
+  const evidence = { book: book ? { ...book } : null, observedAt: Date.now() };
+  const empty = { leg, filledQty: 0, price: null, feeAmount: 0, feeCurrency: leg.quote, ...evidence };
+  if (!book || !Number.isFinite(leg.qty) || leg.qty <= 0 || !Number.isFinite(leg.price) || leg.price <= 0
+    || !Number.isFinite(leg.fee) || leg.fee < 0) return empty;
+  const price = leg.side === "buy" ? book.ask : book.bid;
+  const size = leg.side === "buy" ? book.askSize : book.bidSize;
+  if (!Number.isFinite(price) || price <= 0 || !Number.isFinite(size) || size <= 0
+    || (leg.side === "buy" ? price > leg.price : price < leg.price)) return empty;
+  const filledQty = Math.min(leg.qty, size);
+  return { leg, filledQty, price, feeAmount: filledQty * price * leg.fee, feeCurrency: leg.quote, ...evidence };
 }
 
-// `dollar(currency, amount)` gives the USD value of one unit of a stablecoin: what it fetches when held
-// (amount > 0) or what it costs to replace when spent (amount < 0), conversion cost included.
+// The portfolio applies every per-venue cash flow. For economic P&L, matched base inventory on different
+// venues offsets (it remains inventory there); only unmatched base exposure is unwound. Stablecoin flows
+// do NOT offset between venues: restoring each venue's stablecoin balance needs its own USD conversion.
+// A conversion callback supplies an executable, fresh, local currency/USD book and its explicit fee.
+// No callback/book or inadequate depth leaves the result unresolved, rather than inventing a fill.
 export function settle(opportunity: Opportunity, fills: LegFill[], unwindBook: (market: string) => Quote | undefined,
-  dollar: (currency: string, amount: number) => number): ShadowResult {
-  const balances = new Map<string, number>();
-  const add = (currency: string, amount: number) => balances.set(currency, (balances.get(currency) || 0) + amount);
-  for (const { leg, filledQty, price } of fills) {
-    if (!filledQty || price === null) continue;
-    if (leg.side === "buy") { add(leg.base, filledQty); add(leg.quote, -filledQty * price * (1 + leg.fee)); }
-    else { add(leg.base, -filledQty); add(leg.quote, filledQty * price * (1 - leg.fee)); }
+  conversionBook?: (venue: Venue, currency: string) => ConversionBook | undefined): ShadowResult {
+  const balances = new Map<string, AssetCashflow>();
+  const id = (venue: Venue, currency: string) => `${venue}|${currency}`;
+  const add = (venue: Venue, currency: string, amount: number) => {
+    const key = id(venue, currency);
+    balances.set(key, { venue, currency, amount: (balances.get(key)?.amount || 0) + amount });
+  };
+  const apply = ({ leg, filledQty, price, feeAmount, feeCurrency }: LegFill) => {
+    if (!filledQty || price === null) return;
+    const direction = leg.side === "buy" ? 1 : -1;
+    add(leg.venue, leg.base, direction * filledQty);
+    add(leg.venue, leg.quote, -direction * filledQty * price);
+    add(leg.venue, feeCurrency, -feeAmount);
+  };
+  fills.forEach(apply);
+  const total = (currency: string) => [...balances.values()].filter((b) => b.currency === currency).reduce((n, b) => n + b.amount, 0);
+  const reasons = new Map<string, string>();
+  // A displayed level cannot be consumed again by another unwind/conversion in this settlement.
+  const remaining = new Map<string, number>();
+  const consume = (leg: Leg, book: Quote): LegFill => {
+    const key = `${leg.market}|${leg.side}`;
+    const available = remaining.get(key) ?? (leg.side === "buy" ? book.askSize : book.bidSize);
+    const result = fillLeg(leg, { ...book, [leg.side === "buy" ? "askSize" : "bidSize"]: available });
+    remaining.set(key, available - result.filledQty);
+    return result;
+  };
+  const unwound: string[] = [], unwindFills: LegFill[] = [], conversionFills: LegFill[] = [];
+  // A triangle unwind can produce another non-dollar currency. Iterate until no further fill is possible.
+  for (let pass = 0; pass <= opportunity.legs.length; pass++) {
+    let progressed = false;
+    const currencies = new Set([...balances.values()].map((b) => b.currency));
+    for (const currency of currencies) {
+      if (currency === "USD" || isDollarStable(currency)) continue;
+      for (const balance of [...balances.values()].filter((b) => b.currency === currency)) {
+        const amount = total(currency), current = balances.get(id(balance.venue, currency))!.amount;
+        if (Math.abs(amount) < EPS || Math.sign(current) !== Math.sign(amount)) continue;
+        const candidates = opportunity.legs.filter((leg) => leg.venue === balance.venue && leg.base === currency);
+        const source = candidates.find((l) => l.quote === "USD" || isDollarStable(l.quote)) || candidates[candidates.length - 1];
+        const key = id(balance.venue, currency);
+        if (!source) { reasons.set(key, "No unwind market on the venue holding the exposure"); continue; }
+        const book = unwindBook(source.market);
+        if (!book) { reasons.set(key, "No fresh unwind book"); continue; }
+        const side = amount > 0 ? "sell" : "buy";
+        const leg = { ...source, side, qty: Math.min(Math.abs(amount), Math.abs(current)),
+          price: side === "sell" ? book.bid : book.ask, size: side === "sell" ? book.bidSize : book.askSize } satisfies Leg;
+        const fill = consume(leg, book);
+        reasons.set(key, "Insufficient executable unwind depth");
+        if (!fill.filledQty) continue;
+        apply(fill); unwindFills.push(fill); progressed = true;
+        unwound.push(`${side === "sell" ? "sold" : "bought back"} ${fill.filledQty.toPrecision(4)} ${currency} on ${leg.venue}`);
+      }
+    }
+    if (!progressed) break;
   }
-  // Coins left over (bought but not sold, or sold but not bought) are closed out on the market of the leg
-  // that traded them, preferring one priced in dollars, at that market's latest price and taker fee.
-  const unwound: string[] = [];
-  for (let pass = 0; pass < 2; pass++) {
-    for (const [currency, amount] of [...balances]) {
-      if (currency === "USD" || isDollarStable(currency) || Math.abs(amount) < 1e-12) continue;
-      const candidates = opportunity.legs.filter((leg) => leg.base === currency);
-      const leg = candidates.find((l) => l.quote === "USD" || isDollarStable(l.quote)) || candidates[candidates.length - 1];
-      if (!leg) continue;
-      // Without a fresh book, fall back to the leg's own price.
-      const book = unwindBook(leg.market);
-      const bid = book?.bid ?? leg.price, ask = book?.ask ?? leg.price;
-      balances.set(currency, 0);
-      if (amount > 0) add(leg.quote, amount * bid * (1 - leg.fee));
-      else add(leg.quote, amount * ask * (1 + leg.fee));
-      unwound.push(`${amount > 0 ? "sold" : "bought back"} ${Math.abs(amount).toPrecision(4)} ${currency} on ${leg.venue}`);
+  // These fills are separately auditable simulated conversions, never a midpoint valuation or $1 fallback.
+  for (const balance of [...balances.values()]) {
+    if (!isDollarStable(balance.currency) || Math.abs(balance.amount) < EPS) continue;
+    const key = id(balance.venue, balance.currency);
+    const conversion = conversionBook?.(balance.venue, balance.currency);
+    if (!conversion || conversion.market !== `${balance.venue}|${balance.currency}/USD`) {
+      reasons.set(key, "No fresh same-venue USD conversion book"); continue;
+    }
+    const side = balance.amount > 0 ? "sell" : "buy", book = conversion.quote;
+    const leg: Leg = { venue: balance.venue, pair: `${balance.currency}/USD`, base: balance.currency, quote: "USD", side,
+      price: side === "sell" ? book.bid : book.ask, market: conversion.market,
+      size: side === "sell" ? book.bidSize : book.askSize, qty: Math.abs(balance.amount), fee: conversion.fee };
+    const fill = consume(leg, book);
+    reasons.set(key, "Insufficient executable USD conversion depth");
+    if (fill.filledQty) { apply(fill); conversionFills.push(fill); }
+  }
+  const unresolved: Exposure[] = [];
+  for (const currency of new Set([...balances.values()].map((b) => b.currency))) {
+    if (currency === "USD") continue;
+    const own = [...balances.values()].filter((b) => b.currency === currency);
+    if (isDollarStable(currency)) {
+      for (const b of own) if (Math.abs(b.amount) >= EPS) unresolved.push({ ...b, reason: reasons.get(id(b.venue, currency)) || "USD conversion incomplete" });
+      continue;
+    }
+    let outstanding = total(currency);
+    for (const b of own) {
+      if (Math.abs(outstanding) < EPS || Math.sign(b.amount) !== Math.sign(outstanding)) continue;
+      const amount = Math.sign(outstanding) * Math.min(Math.abs(outstanding), Math.abs(b.amount));
+      unresolved.push({ ...b, amount, reason: reasons.get(id(b.venue, currency)) || "Unmatched asset exposure" });
+      outstanding -= amount;
     }
   }
-  let realizedNet = 0;
-  for (const [currency, amount] of balances) {
-    if (currency === "USD") realizedNet += amount;
-    else if (isDollarStable(currency)) realizedNet += amount * dollar(currency, amount);
-  }
+  const cashflows = [...balances.values()].filter((b) => Math.abs(b.amount) >= EPS);
+  const knownNet = total("USD"), accountingComplete = unresolved.length === 0;
   const fractions = fills.map((f) => f.leg.qty ? f.filledQty / f.leg.qty : 0);
   const filledFraction = fractions.length ? Math.min(...fractions) : 0;
-  const outcome: ShadowOutcome = fractions.every((f) => f >= FULL) ? "filled" : fractions.every((f) => f === 0) ? "missed" : "partial";
-  return { outcome, expectedNet: opportunity.net, realizedNet: outcome === "missed" ? 0 : realizedNet, filledFraction, unwound, fills };
+  const outcome: ShadowOutcome = fractions.length && fractions.every((f) => f >= FULL) ? "filled" : fractions.every((f) => f === 0) ? "missed" : "partial";
+  return { execution: "simulated", outcome, expectedNet: opportunity.net, realizedNet: accountingComplete ? knownNet : null,
+    knownNet, accountingComplete, filledFraction, unwound, fills, unwindFills, conversionFills, cashflows, unresolved };
 }
 
 // Round-trip latency per venue from repeated lightweight requests; the median resists one-off stalls.
