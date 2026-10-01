@@ -45,7 +45,7 @@ export function parseFutures(body: unknown): { perps: Perp[]; dated: Dated[] } {
     const interval = /^(\d+)s$/.exec(String(f.funding_interval || ""));
     if (interval) {
       const fundingRate = num(f.funding_rate), fundingTime = Date.parse(String(f.funding_time || "")), index = num(f.index_price);
-      if (!Number.isFinite(fundingRate) || !Number.isFinite(fundingTime) || !(index > 0)) continue;
+      if (!Number.isFinite(fundingRate) || !Number.isFinite(fundingTime) || !(index > 0) || Number(interval[1]) <= 0) continue;
       perps.push({ id: p.product_id, coin, contractSize, price, index, fundingRate, fundingTime, intervalHours: Number(interval[1]) / 3600,
         shortMargin, openInterest: num(f.open_interest) || 0, volume24h });
     } else {
@@ -86,7 +86,10 @@ export function quoteCarry(perp: Perp, book: Book, spot: SpotSide, unit: number,
   const contractNotional = perp.contractSize * book.bid;
   // Cash one contract ties up: the coins with their fee, the collateral and the futures fee.
   const perContractCapital = coinsPerContract * spot.ask * (1 + spot.fee) + contractNotional * (o.marginBuffer + o.futuresFee);
-  const contracts = Math.floor(o.capital / perContractCapital);
+  const budgetContracts = Math.max(0, Math.floor(o.capital / perContractCapital));
+  const futuresContracts = Math.max(0, Math.floor(book.bidSize));
+  const spotContracts = Math.max(0, Math.floor(spot.askSize / coinsPerContract));
+  const contracts = Math.min(budgetContracts, futuresContracts, spotContracts);
   const spotMid = (spot.bid + spot.ask) / 2, perpMid = (book.bid + book.ask) / 2;
   const roundTripPct = 2 * spot.fee + 2 * o.futuresFee + (spot.ask - spot.bid) / spotMid + (book.ask - book.bid) / perpMid;
   const netApr = fundingApr - roundTripPct * 365 / o.holdDays;
@@ -99,9 +102,9 @@ export function quoteCarry(perp: Perp, book: Book, spot: SpotSide, unit: number,
   // Collateral must clear the overnight margin with room for the price to rise before a margin call.
   const reason = o.marginBuffer < perp.shortMargin * MARGIN_HEADROOM
     ? `Needs over ${Math.ceil(perp.shortMargin * MARGIN_HEADROOM * 100)}% collateral (overnight margin is ${Math.round(perp.shortMargin * 100)}%)` :
-    contracts < 1 ? `One contract needs $${Math.ceil(perContractCapital).toLocaleString("en-US")}` :
-    book.bidSize < contracts ? "Not enough futures size at the best bid" :
-    spot.askSize < contracts * coinsPerContract ? `Not enough ${perp.coin} at the best ask on ${spot.venue}` : null;
+    budgetContracts < 1 ? `One contract needs $${Math.ceil(perContractCapital).toLocaleString("en-US")}` :
+    futuresContracts < 1 ? "Not enough futures size at the best bid" :
+    spotContracts < 1 ? `Not enough ${perp.coin} at the best ask on ${spot.venue}` : null;
   return { ...base, reason };
 }
 
@@ -110,6 +113,9 @@ export type CarryPosition = {
   contracts: number; contractSize: number; spotQty: number; openedAt: number;
   entrySpot: number; entryPerp: number; collateral: number; spotFee: number; futuresFee: number;
   fees: number; funding: number; fundingPayments: number; lastFundingTime: number;
+  // Only funding with a settlement-time futures mark may be included in funding.
+  unresolvedFundingPayments?: number; legacyFundingEstimate?: number;
+  lastMark?: { at: number; mark: Mark };
   closedAt?: number; exitSpot?: number; exitPerp?: number; closeReason?: string; realized?: number;
 };
 
@@ -119,17 +125,24 @@ export function openCarry(id: string, perp: Perp, book: Book, spot: SpotSide, un
   return {
     id, perpId: perp.id, coin: perp.coin, spotVenue: spot.venue, unit, contracts, contractSize: perp.contractSize, spotQty, openedAt: now,
     entrySpot: spot.ask, entryPerp: book.bid, collateral: shortNotional * o.marginBuffer, spotFee: spot.fee, futuresFee: o.futuresFee,
-    fees: spotQty * spot.ask * spot.fee + shortNotional * o.futuresFee, funding: 0, fundingPayments: 0, lastFundingTime: now,
+    fees: spotQty * spot.ask * spot.fee + shortNotional * o.futuresFee, funding: 0, fundingPayments: 0, lastFundingTime: now, unresolvedFundingPayments: 0,
   };
 }
 
 // Cash put in at the open: the coins bought (with their fee) plus the collateral and the futures fee.
 export const openingCost = (p: CarryPosition) => p.spotQty * p.entrySpot * (1 + p.spotFee) + p.collateral + p.contracts * p.contractSize * p.entryPerp * p.futuresFee;
 
-// A funding settlement on a short: positive rates are received, negative ones paid, on the notional at the index.
-export function fundingPayment(p: CarryPosition, rate: number, index: number) {
-  return p.contracts * p.contractSize * index * rate;
+// Requires the futures mark for that specific settlement, never a current spot index.
+export function fundingPayment(p: CarryPosition, rate: number, settlementMark: number) {
+  return p.contracts * p.contractSize * settlementMark * rate;
 }
+
+// Persisted counters survive pruning the recent closed-position display list.
+export type CarryAccounting = {
+  version: 1; lifetimeFees: number; confirmedFunding: number;
+  unresolvedFundingPayments: number; historyComplete: boolean;
+  legacyFundingEstimate: number;
+};
 
 export type Mark = {
   spotPnl: number; shortPnl: number; exitFees: number; value: number; net: number;

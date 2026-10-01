@@ -3,14 +3,17 @@ import type { VerdictKind } from "./verify";
 // How far the paper estimates are from what the replayed (shadow) trades would really have made, and how
 // often the suspect-gap rule is too cautious or not cautious enough.
 
-export type ShadowTally = { filled: number; partial: number; missed: number; expected: number; realized: number; absError: number; losses: number };
+export type ShadowTally = { filled: number; partial: number; missed: number; expected: number; realized: number; absError: number; losses: number; unresolved: number; expectedComplete: number };
 
-export const emptyTally = (): ShadowTally => ({ filled: 0, partial: 0, missed: 0, expected: 0, realized: 0, absError: 0, losses: 0 });
+export const emptyTally = (): ShadowTally => ({ filled: 0, partial: 0, missed: 0, expected: 0, realized: 0, absError: 0, losses: 0, unresolved: 0, expectedComplete: 0 });
 
 // Adds one replayed trade: `expected` is the paper net, `realized` the replayed net.
-export function addReplay(tally: ShadowTally, outcome: "filled" | "partial" | "missed", expected: number, realized: number) {
+export function addReplay(tally: ShadowTally, outcome: "filled" | "partial" | "missed", expected: number, realized: number | null) {
   tally[outcome]++;
   tally.expected += expected;
+  // Unknown P&L is not a zero-dollar result and must not improve the error/loss metrics.
+  if (realized === null || !Number.isFinite(realized)) { tally.unresolved++; return; }
+  tally.expectedComplete += expected;
   tally.realized += realized;
   tally.absError += Math.abs(realized - expected);
   if (expected > 0 && realized < 0) tally.losses++;
@@ -18,6 +21,9 @@ export function addReplay(tally: ShadowTally, outcome: "filled" | "partial" | "m
 
 export type Accuracy = {
   replays: number;
+  completedReplays: number;
+  unresolvedReplays: number;
+  unresolvedPct: number | null;
   // Share of paper trades that would not have gone through as seen: one side only, or nothing at all.
   wrongPct: number | null;
   missedPct: number | null;
@@ -33,14 +39,16 @@ export type Accuracy = {
 
 export function accuracy(t: ShadowTally): Accuracy {
   const replays = t.filled + t.partial + t.missed;
+  const unresolvedReplays = t.unresolved;
+  const completedReplays = replays - unresolvedReplays;
   const share = (n: number) => replays ? (n / replays) * 100 : null;
   return {
-    replays,
+    replays, completedReplays, unresolvedReplays, unresolvedPct: share(unresolvedReplays),
     wrongPct: share(t.partial + t.missed), missedPct: share(t.missed), partialPct: share(t.partial),
-    meanError: replays ? (t.realized - t.expected) / replays : null,
-    meanAbsError: replays ? t.absError / replays : null,
-    lossPct: share(t.losses),
-    capturePct: t.expected > 0 ? (t.realized / t.expected) * 100 : null,
+    meanError: completedReplays ? (t.realized - t.expectedComplete) / completedReplays : null,
+    meanAbsError: completedReplays ? t.absError / completedReplays : null,
+    lossPct: completedReplays ? t.losses / completedReplays * 100 : null,
+    capturePct: t.expectedComplete > 0 ? (t.realized / t.expectedComplete) * 100 : null,
   };
 }
 

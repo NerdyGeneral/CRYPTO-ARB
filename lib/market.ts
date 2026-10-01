@@ -1,6 +1,14 @@
 export type Venue = "Coinbase" | "Kraken" | "Gemini" | "Bitstamp" | "CEX.IO" | "Crypto.com" | "bitFlyer" | "OKX US" | "Binance.US";
 export type SymbolName = "BTC" | "ETH" | "SOL" | "XRP" | "DOGE" | "LTC" | "ADA" | "AVAX" | "LINK" | "XLM" | "BCH" | "UNI" | "AAVE" | "DOT" | "SHIB" | "SUI" | "HBAR" | "PEPE" | "NEAR" | "ETC" | "ATOM" | "TRX" | "OP" | "ARB" | "ALGO" | "APT" | "FIL" | "GRT" | "ICP" | "POL" | "ENS" | "BONK" | "BAT" | "CRV" | "FET" | "JUP" | "LDO" | "MANA" | "SEI" | "XTZ";
-export type Quote = { bid: number; bidSize: number; ask: number; askSize: number; receivedAt: number; source: "stream" | "poll" };
+export type QuoteProvenance = {
+  // Exchange event time in epoch milliseconds, when the feed supplies one. It is not our local clock.
+  exchangeAt?: number;
+  // Strings preserve integer IDs without imposing JavaScript's number precision on them.
+  sequence?: string;
+  requestStartedAt?: number;
+  connectionId?: number;
+};
+export type Quote = QuoteProvenance & { bid: number; bidSize: number; ask: number; askSize: number; receivedAt: number; source: "stream" | "poll" };
 export type Snapshot = {
   generatedAt: number;
   markets: Record<SymbolName, Partial<Record<Venue, Quote>>>;
@@ -63,10 +71,32 @@ export const pct = (n: number) => `${n >= 0 ? "+" : "−"}${Math.abs(n).toFixed(
 export const price = (n: number) => money(n, n < 0.001 ? 10 : n < 1 ? 6 : n < 10 ? 4 : 2);
 export const emptyMarkets = (): Snapshot["markets"] => Object.fromEntries(symbols.map((symbol) => [symbol, {}])) as Snapshot["markets"];
 
-export function validQuote(bid: unknown, bidSize: unknown, ask: unknown, askSize: unknown, source: Quote["source"]): Quote | null {
+// Without calibrated exchange clocks, permit only this explicitly bounded uncertainty. This is a
+// conservative freshness guard, not a measurement of one-way network latency or clock synchronization.
+export const EXCHANGE_CLOCK_TOLERANCE_MS = 5_000;
+export function quoteFresh(quote: Quote, now = Date.now(), ttlMs = 12_000, clockToleranceMs = EXCHANGE_CLOCK_TOLERANCE_MS): boolean {
+  if (!Number.isFinite(quote.receivedAt) || quote.receivedAt > now || now - quote.receivedAt > ttlMs) return false;
+  if (quote.requestStartedAt !== undefined && (!Number.isFinite(quote.requestStartedAt) || quote.requestStartedAt > quote.receivedAt || now - quote.requestStartedAt > ttlMs)) return false;
+  if (quote.exchangeAt !== undefined && (!Number.isFinite(quote.exchangeAt) || quote.exchangeAt > quote.receivedAt + clockToleranceMs || now - quote.exchangeAt > ttlMs + clockToleranceMs)) return false;
+  return true;
+}
+
+// Units are specified by each adapter; guessing units by magnitude would hide a changed API schema.
+export function exchangeTime(value: unknown, unit: "iso" | "seconds" | "milliseconds" | "microseconds" | "nanoseconds"): number | undefined {
+  if (value === undefined || value === null) return undefined;
+  return unit === "iso" ? Date.parse(String(value)) : Number(value) * ({ seconds: 1000, milliseconds: 1, microseconds: 0.001, nanoseconds: 0.000001 }[unit]);
+}
+export function quoteSequence(value: unknown): string | undefined {
+  if (typeof value === "number") return Number.isSafeInteger(value) && value >= 0 ? String(value) : undefined;
+  return typeof value === "string" && /^\d+$/.test(value) ? value : undefined;
+}
+
+export function validQuote(bid: unknown, bidSize: unknown, ask: unknown, askSize: unknown, source: Quote["source"], provenance: QuoteProvenance = {}): Quote | null {
   const values = [bid, bidSize, ask, askSize].map(Number);
   if (values.some((n) => !Number.isFinite(n) || n <= 0) || values[0] >= values[2]) return null;
-  return { bid: values[0], bidSize: values[1], ask: values[2], askSize: values[3], receivedAt: Date.now(), source };
+  const receivedAt = Date.now();
+  const quote = { bid: values[0], bidSize: values[1], ask: values[2], askSize: values[3], ...provenance, receivedAt, source };
+  return quoteFresh(quote, receivedAt) ? quote : null;
 }
 
 export function routesFor(snapshot: Snapshot | null, settings: Settings, balance: number, universe: Universe = defaultUniverse, now = Date.now()): Route[] {

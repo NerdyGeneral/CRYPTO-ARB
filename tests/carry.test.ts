@@ -53,7 +53,7 @@ test("funding, basis and fees add up on a round trip, and the margin call price 
   const perp = btc();
   const p = openCarry("c1", perp, book, spot, 1, 2, options, 0);
   close(openingCost(p), 0.02 * 84070 * 1.0002 + 0.02 * 84090 * 1 + 0.02 * 84090 * 0.0005);
-  // Two hours of funding: +0.0008% and −0.0002% of the notional at the index.
+  // Two reconciled hours of funding using their respective settlement futures marks.
   p.funding += fundingPayment(p, 0.000008, 84000) + fundingPayment(p, -0.000002, 84100);
   close(p.funding, 0.02 * (84000 * 0.000008 - 84100 * 0.000002));
   // Price rises 1% on both legs: the spot gain and the short loss cancel, leaving funding minus fees.
@@ -76,4 +76,15 @@ test("trailing funding needs enough settlements; dated futures lock the basis to
   close(q.basisPct, (84820 / 84070 - 1) * 100);
   close(q.netPct, q.basisPct - (2 * 0.0002 + 2 * 0.0005 + 10 / 84065) * 100);
   close(q.netApr!, q.netPct / 100 * 365 / 30);
+});
+
+
+test("carry entry sizes to whole contracts executable on both legs", () => {
+  const q = quoteCarry(btc(), { ...book, bidSize: 1.9 }, spot, 1, 0.12, { ...options, capital: 20000 });
+  assert.equal(q.contracts, 1);
+  assert.equal(q.reason, null);
+  const limitedSpot = quoteCarry(btc(), book, { ...spot, askSize: 0.025 }, 1, 0.12, { ...options, capital: 20000 });
+  assert.equal(limitedSpot.contracts, 2);
+  assert.equal(limitedSpot.reason, null);
+  assert.equal(quoteCarry(btc(), book, spot, 1, 0.12, { ...options, capital: -10 }).contracts, 0);
 });

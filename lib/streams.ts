@@ -1,4 +1,4 @@
-import { supportedPair, validQuote, type Quote, type SymbolName, type Universe, type Venue } from "./market";
+import { exchangeTime, quoteSequence, supportedPair, validQuote, type Quote, type QuoteProvenance, type SymbolName, type Universe, type Venue } from "./market";
 import { usdMarket, type Market } from "./markets";
 
 type OnQuote = (symbol: SymbolName, venue: Venue, quote: Quote) => void;
@@ -17,14 +17,17 @@ class Book {
   static from(bids: unknown, asks: unknown) {
     const book = new Book();
     for (const [rows, side] of [[bids, "bid"], [asks, "ask"]] as const) {
-      if (!Array.isArray(rows)) continue;
-      for (const row of rows) if (Array.isArray(row)) book.set(side, Number(row[0]), Number(row[1]));
+      if (!Array.isArray(rows)) throw new Error("invalid book snapshot");
+      for (const row of rows) {
+        if (!Array.isArray(row)) throw new Error("invalid book level");
+        book.set(side, Number(row[0]), Number(row[1]));
+      }
     }
     return book;
   }
 
   set(side: "bid" | "ask", price: number, size: number) {
-    if (!Number.isFinite(price) || price <= 0 || !Number.isFinite(size) || size < 0) return;
+    if (!Number.isFinite(price) || price <= 0 || !Number.isFinite(size) || size < 0) throw new Error("invalid book level");
     const levels = side === "bid" ? this.bids : this.asks;
     if (size === 0) {
       levels.delete(price);
@@ -37,8 +40,8 @@ class Book {
     if (side === "ask" && price < this.bestAsk) this.bestAsk = price;
   }
 
-  quote() {
-    return validQuote(this.bestBid, this.bids.get(this.bestBid), this.bestAsk, this.asks.get(this.bestAsk), "stream");
+  quote(provenance: QuoteProvenance = {}) {
+    return validQuote(this.bestBid, this.bids.get(this.bestBid), this.bestAsk, this.asks.get(this.bestAsk), "stream", provenance);
   }
 }
 
@@ -60,7 +63,7 @@ const streamUrl: Record<Venue, string | null> = {
 // which with its ping every 8s stays near 70 requests a minute.
 const maxPerSocket: Partial<Record<Venue, number>> = { "CEX.IO": 100, "Binance.US": 1000 };
 const subscribeGapMs: Partial<Record<Venue, number>> = { "CEX.IO": 1000, Bitstamp: 25 };
-const pause = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+let connectionId = 0;
 // A socket that has received nothing for this long (not even a heartbeat) is treated as dead: after a network
 // drop a connection can stay half-open without ever closing, so it is abandoned and replaced.
 export const SILENT_SOCKET_MS = 90_000;
@@ -81,9 +84,7 @@ const slotDelay = (venue: Venue) => {
 export function connectStreams(markets: Market[], onQuote: OnMarketQuote, onStale?: OnMarketStale): () => void {
   if (typeof WebSocket === "undefined") return () => {};
   let stopped = false;
-  const sockets: WebSocket[] = [];
   type Timer = ReturnType<typeof setTimeout>;
-  const timers: Timer[] = [];
   const page = typeof document === "undefined" ? undefined : document;
   const isVisible = () => !page?.hidden;
 
@@ -95,29 +96,38 @@ export function connectStreams(markets: Market[], onQuote: OnMarketQuote, onStal
     let reconnectTimer: Timer | undefined;
     let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
     let lastMessageAt = 0;
+    const delays = new Map<Timer, () => void>();
+    const pause = (ms: number) => new Promise<void>((resolve) => {
+      const timer = setTimeout(() => { delays.delete(timer); resolve(); }, ms);
+      delays.set(timer, resolve);
+    });
     let books = new Map<Market, Book>();
     let cexBooks = new Map<Market, { book: Book; seqId: number }>();
     let resyncing = new Set<Market>();
+    const latest = new Map<Market, Quote>();
     const cexSubscribe = (market: Market) => JSON.stringify({ e: "order_book_subscribe", oid: `${market.ws}-${Date.now()}`, data: { pair: market.ws } });
     const start = () => {
-      if (stopped || !isVisible()) return;
+      if (stopped || !isVisible() || socket) return;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      reconnectTimer = undefined;
       books = new Map();
       cexBooks = new Map();
       resyncing = new Set();
       try { socket = new WebSocket(url); } catch { schedule(); return; }
       const ws = socket;
-      sockets.push(ws);
+      const generation = ++connectionId;
       lastMessageAt = Date.now();
       // Sends one message per book in the venue's shared send slots, until the socket closes.
       const paced = async (messages: string[]) => {
         for (const message of messages) {
           const delay = slotDelay(venue);
           if (delay) await pause(delay);
-          if (socket !== ws || ws.readyState !== WebSocket.OPEN) return;
+          if (stopped || socket !== ws || ws.readyState !== WebSocket.OPEN) return;
           ws.send(message);
         }
       };
       ws.onopen = () => {
+        if (stopped || socket !== ws) return;
         attempts = 0;
         const names = list.map((market) => market.ws);
         if (venue === "Coinbase") {
@@ -133,10 +143,10 @@ export function connectStreams(markets: Market[], onQuote: OnMarketQuote, onStal
           void paced(names.map((name) => JSON.stringify({ event: "bts:subscribe", data: { channel: `order_book_${name}` } })));
         } else if (venue === "CEX.IO") {
           void paced(list.map(cexSubscribe));
-          heartbeatTimer = setInterval(() => { if (socket === ws) ws.send(JSON.stringify({ e: "ping" })); }, 8000);
+          heartbeatTimer = setInterval(() => { if (!stopped && socket === ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ e: "ping" })); }, 8000);
         } else if (venue === "OKX US") {
           ws.send(JSON.stringify({ id: String(Date.now()), op: "subscribe", args: names.map((instId) => ({ channel: "bbo-tbt", instId })) }));
-          heartbeatTimer = setInterval(() => { if (socket === ws) ws.send("ping"); }, textPing[venue]);
+          heartbeatTimer = setInterval(() => { if (!stopped && socket === ws && ws.readyState === WebSocket.OPEN) ws.send("ping"); }, textPing[venue]);
         } else if (venue === "Binance.US") {
           for (let i = 0; i < names.length; i += 200)
             ws.send(JSON.stringify({ method: "SUBSCRIBE", params: names.slice(i, i + 200).map((name) => `${name}@bookTicker`), id: i + 1 }));
@@ -145,22 +155,37 @@ export function connectStreams(markets: Market[], onQuote: OnMarketQuote, onStal
         }
       };
       ws.onmessage = (event) => {
+        if (stopped || socket !== ws) return;
         lastMessageAt = Date.now();
         try {
           if (event.data === "ping") { ws.send("pong"); return; }
+          if (event.data === "pong") return;
           const message = JSON.parse(String(event.data)) as Record<string, unknown>;
-          const emit = (market: Market | undefined, quote: Quote | null) => { if (market && quote) onQuote(market, quote); };
+          const emit = (market: Market | undefined, quote: Quote | null) => {
+            if (!market) return;
+            if (!quote) { onStale?.(market); return; }
+            const previous = latest.get(market);
+            // These BBO feeds can skip IDs, but older/duplicate updates cannot refresh a book.
+            // Other venues have different sequence semantics (OKX can reset IDs during maintenance).
+            if ((venue === "Gemini" || venue === "Binance.US") && previous?.sequence && quote.sequence && BigInt(quote.sequence) <= BigInt(previous.sequence)) return;
+            if (previous?.exchangeAt !== undefined && quote.exchangeAt !== undefined && quote.exchangeAt < previous.exchangeAt) return;
+            quote.connectionId = generation;
+            latest.set(market, quote);
+            onQuote(market, quote);
+          };
           if (venue === "Gemini") {
-            emit(find(message.s), validQuote(message.b, message.B, message.a, message.A, "stream"));
+            emit(find(message.s), validQuote(message.b, message.B, message.a, message.A, "stream", { exchangeAt: exchangeTime(message.E, "nanoseconds"), sequence: quoteSequence(message.u) }));
           } else if (venue === "Binance.US") {
             const data = message.data as Record<string, unknown> | undefined;
-            if (data) emit(find(data.s), validQuote(data.b, data.B, data.a, data.A, "stream"));
+            if (data) emit(find(data.s), validQuote(data.b, data.B, data.a, data.A, "stream", { sequence: quoteSequence(data.u) }));
           } else if (venue === "Bitstamp") {
             if (message.event === "bts:request_reconnect") { ws.close(); return; }
             if (message.event !== "data") return;
-            const depth = message.data as { bids?: unknown[][]; asks?: unknown[][] } | undefined;
+            const depth = message.data as { bids?: unknown[][]; asks?: unknown[][]; microtimestamp?: string; timestamp?: string } | undefined;
             emit(find(String(message.channel || "").replace(/^order_book_/, "")),
-              validQuote(depth?.bids?.[0]?.[0], depth?.bids?.[0]?.[1], depth?.asks?.[0]?.[0], depth?.asks?.[0]?.[1], "stream"));
+              validQuote(depth?.bids?.[0]?.[0], depth?.bids?.[0]?.[1], depth?.asks?.[0]?.[0], depth?.asks?.[0]?.[1], "stream", {
+                exchangeAt: depth?.microtimestamp !== undefined ? exchangeTime(depth.microtimestamp, "microseconds") : exchangeTime(depth?.timestamp, "seconds"),
+              }));
           } else if (venue === "CEX.IO") {
             if (message.e === "disconnected") { ws.close(); return; }
             if (message.ok !== "ok" || (message.e !== "order_book_subscribe" && message.e !== "order_book_increment")) return;
@@ -168,8 +193,9 @@ export function connectStreams(markets: Market[], onQuote: OnMarketQuote, onStal
             const market = find(data?.pair);
             if (!market) return;
             if (message.e === "order_book_subscribe") {
-              if (!Number.isSafeInteger(data?.seqId)) return;
+              if (!Number.isSafeInteger(data?.seqId)) { onStale?.(market); return; }
               cexBooks.set(market, { book: Book.from(data?.bids, data?.asks), seqId: data!.seqId! });
+              latest.delete(market); // A requested snapshot establishes a new sequence baseline.
               resyncing.delete(market);
             } else {
               const entry = cexBooks.get(market);
@@ -180,73 +206,91 @@ export function connectStreams(markets: Market[], onQuote: OnMarketQuote, onStal
                 return;
               }
               entry.seqId = data!.seqId!;
-              for (const row of data?.bids || []) if (Array.isArray(row)) entry.book.set("bid", Number(row[0]), Number(row[1]));
-              for (const row of data?.asks || []) if (Array.isArray(row)) entry.book.set("ask", Number(row[0]), Number(row[1]));
+              for (const [rows, side] of [[data?.bids || [], "bid"], [data?.asks || [], "ask"]] as const) {
+                for (const row of rows) {
+                  if (!Array.isArray(row)) throw new Error("invalid book level");
+                  entry.book.set(side, Number(row[0]), Number(row[1]));
+                }
+              }
             }
-            emit(market, cexBooks.get(market)?.book.quote() ?? null);
+            emit(market, cexBooks.get(market)?.book.quote({ sequence: quoteSequence(data?.seqId) }) ?? null);
           } else if (venue === "OKX US") {
             const arg = message.arg as { channel?: string; instId?: string } | undefined;
             if (arg?.channel !== "bbo-tbt" || !Array.isArray(message.data)) return;
-            const depth = (message.data as { bids?: unknown[][]; asks?: unknown[][] }[])[0];
-            emit(find(arg.instId), validQuote(depth?.bids?.[0]?.[0], depth?.bids?.[0]?.[1], depth?.asks?.[0]?.[0], depth?.asks?.[0]?.[1], "stream"));
+            const depth = (message.data as { bids?: unknown[][]; asks?: unknown[][]; ts?: string; seqId?: number }[])[0];
+            emit(find(arg.instId), validQuote(depth?.bids?.[0]?.[0], depth?.bids?.[0]?.[1], depth?.asks?.[0]?.[0], depth?.asks?.[0]?.[1], "stream", { exchangeAt: exchangeTime(depth?.ts, "milliseconds"), sequence: quoteSequence(depth?.seqId) }));
           } else if (venue === "Crypto.com") {
             if (message.method === "public/heartbeat") { ws.send(JSON.stringify({ id: message.id, method: "public/respond-heartbeat" })); return; }
             const result = message.result as { channel?: string; instrument_name?: string; data?: Record<string, unknown>[] } | undefined;
             if (result?.channel !== "ticker" || !Array.isArray(result.data)) return;
-            for (const tick of result.data) emit(find(tick.i || result.instrument_name), validQuote(tick.b, tick.bs, tick.k, tick.ks, "stream"));
+            for (const tick of result.data) emit(find(tick.i || result.instrument_name), validQuote(tick.b, tick.bs, tick.k, tick.ks, "stream", { exchangeAt: exchangeTime(tick.t, "milliseconds") }));
           } else if (venue === "Kraken") {
             if (message.channel !== "ticker" || !Array.isArray(message.data)) return;
-            for (const ticker of message.data as Record<string, unknown>[]) emit(find(ticker.symbol), validQuote(ticker.bid, ticker.bid_qty, ticker.ask, ticker.ask_qty, "stream"));
+            for (const ticker of message.data as Record<string, unknown>[]) emit(find(ticker.symbol), validQuote(ticker.bid, ticker.bid_qty, ticker.ask, ticker.ask_qty, "stream", { exchangeAt: exchangeTime(ticker.timestamp, "iso") }));
           } else {
             const market = find(message.product_id);
             if (!market) return;
+            const eventAt = exchangeTime(message.time, "iso");
+            const previousAt = latest.get(market)?.exchangeAt;
+            // Reject an obsolete delta before it can mutate the replacement book.
+            if (eventAt !== undefined && previousAt !== undefined && eventAt < previousAt) return;
             if (message.type === "snapshot") {
               books.set(market, Book.from(message.bids, message.asks));
             } else if (message.type === "l2update") {
               const book = books.get(market);
-              if (!book || !Array.isArray(message.changes)) return;
+              if (!book) { onStale?.(market); return; }
+              if (!Array.isArray(message.changes)) throw new Error("invalid book update");
               for (const change of message.changes as unknown[][]) {
-                if (Array.isArray(change) && (change[0] === "buy" || change[0] === "sell")) book.set(change[0] === "buy" ? "bid" : "ask", Number(change[1]), Number(change[2]));
+                if (!Array.isArray(change) || (change[0] !== "buy" && change[0] !== "sell")) throw new Error("invalid book update");
+                book.set(change[0] === "buy" ? "bid" : "ask", Number(change[1]), Number(change[2]));
               }
             } else return;
-            emit(market, books.get(market)?.quote() ?? null);
+            emit(market, books.get(market)?.quote({ exchangeAt: eventAt, sequence: quoteSequence(message.sequence) }) ?? null);
           }
-        } catch { /* Ignore malformed exchange messages; the REST fallback remains available. */ }
+        } catch { abandon(); /* A malformed update may have broken a delta book; resnapshot. */ }
       };
       // Node's WebSocket fires error again from inside close() on a failed connection; close once.
       let closing = false;
-      ws.onerror = () => { if (closing) return; closing = true; ws.close(); };
+      ws.onerror = () => { if (stopped || socket !== ws || closing) return; closing = true; abandon(); };
       ws.onclose = () => { if (socket === ws) abandon(); };
     };
     // Forgets the current socket and its books and schedules a new connection. A late close event from the
     // abandoned socket is ignored because it is no longer the current one.
-    const abandon = () => {
-      socket = null; books.clear(); cexBooks.clear();
+    const abandon = (reconnect = true) => {
+      const ws = socket;
+      socket = null; books.clear(); cexBooks.clear(); latest.clear(); resyncing.clear();
+      for (const [timer, resolve] of delays) { clearTimeout(timer); resolve(); }
+      delays.clear();
+      if (ws) {
+        ws.onopen = ws.onmessage = ws.onclose = null;
+        ws.onerror = () => {}; // Absorb a close-induced error without retaining the connection's state.
+        try { ws.close(); } catch { /* Already closed. */ }
+      }
       for (const market of list) onStale?.(market);
       if (heartbeatTimer) clearInterval(heartbeatTimer);
       heartbeatTimer = undefined;
-      schedule();
+      if (reconnect) schedule();
     };
     const watchdog = setInterval(() => {
       const ws = socket;
       if (!ws || Date.now() - lastMessageAt < SILENT_SOCKET_MS) return;
       abandon();
-      try { ws.close(); } catch { /* Already closed. */ }
     }, WATCHDOG_MS);
     const schedule = () => {
       if (stopped || !isVisible()) return;
-      reconnectTimer = setTimeout(start, Math.min(10000, 1000 * 2 ** Math.min(attempts++, 4)));
-      timers.push(reconnectTimer);
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      reconnectTimer = setTimeout(() => { reconnectTimer = undefined; start(); }, Math.min(10000, 1000 * 2 ** Math.min(attempts++, 4)));
     };
     const visibility = () => {
       if (!isVisible()) {
         if (reconnectTimer) clearTimeout(reconnectTimer);
-        socket?.close();
+        reconnectTimer = undefined;
+        abandon(false);
       } else if (!socket) start();
     };
     page?.addEventListener("visibilitychange", visibility);
     start();
-    return () => { clearInterval(watchdog); page?.removeEventListener("visibilitychange", visibility); };
+    return () => { clearInterval(watchdog); if (reconnectTimer) clearTimeout(reconnectTimer); page?.removeEventListener("visibilitychange", visibility); abandon(false); };
   };
 
   const byVenue = new Map<Venue, Market[]>();
@@ -260,8 +304,6 @@ export function connectStreams(markets: Market[], onQuote: OnMarketQuote, onStal
   return () => {
     stopped = true;
     cleanups.forEach((cleanup) => cleanup());
-    timers.forEach((timer) => clearTimeout(timer));
-    sockets.forEach((socket) => socket.close());
   };
 }
 
