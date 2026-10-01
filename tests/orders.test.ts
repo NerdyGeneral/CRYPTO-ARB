@@ -4,7 +4,7 @@ import { test } from "node:test";
 import { sendInParallel } from "../lib/execution";
 import { makeMarket } from "../lib/markets";
 import type { Leg } from "../lib/opportunities";
-import { checkLeg, coinbaseCreateOrder, floorToStep, formatStep, krakenAddOrder } from "../lib/orders";
+import { ceilToStep, checkLeg, checkTrade, coinbaseCreateOrder, floorToStep, formatStep, krakenAddOrder, limitPrice } from "../lib/orders";
 import { coinbaseJwt, krakenSignature } from "../lib/signing";
 
 const leg = (over: Partial<Leg> = {}): Leg => ({ venue: "Kraken", pair: "BTC/USD", base: "BTC", quote: "USD", side: "buy", price: 84000.1, market: "Kraken|BTC/USD", size: 1, qty: 0.000595241, fee: 0.004, ...over });
@@ -17,6 +17,35 @@ test("sizes round down to whole lots without floating-point residue", () => {
   assert.equal(floorToStep(0.000595241, 1e-8), 0.00059524);
   assert.equal(formatStep(84000.1, 0.01), "84000.10");
   assert.equal(formatStep(0.5, 0.25), "0.50");
+  // Steps with three significant digits never round up past the value or off the step.
+  assert.equal(floorToStep(0.125, 0.125), 0.125);
+  assert.equal(floorToStep(0.3, 0.125), 0.25);
+  assert.equal(formatStep(1.375, 0.125), "1.375");
+  assert.equal(floorToStep(0.0006, 0.002), 0);
+  // Large values keep their last lot.
+  assert.equal(floorToStep(123456.12345678, 1e-8), 123456.12345678);
+  assert.equal(ceilToStep(84000.3, 0.5), 84000.5);
+  assert.equal(ceilToStep(84000.1, 0.1), 84000.1);
+});
+
+test("limit prices land on the tick without becoming worse than the quoted price", () => {
+  assert.equal(limitPrice(leg({ price: 84000.37 }), 0.1), 84000.3);
+  assert.equal(limitPrice(leg({ side: "sell", price: 84000.37 }), 0.1), 84000.4);
+  assert.equal(limitPrice(leg({ price: 84000.1 + 1e-10 }), 0.1), 84000.1);
+});
+
+test("both sides of a cross-exchange trade are rounded to one size", () => {
+  const fine = { lot: 1e-8, tick: 0.01, minQty: 0, minNotional: 0 };
+  const coarse = { lot: 1e-4, tick: 0.1, minQty: 0, minNotional: 0 };
+  const trade = (qty: number) => ({ kind: "cross" as const, legs: [leg({ qty }), leg({ venue: "Coinbase", side: "sell", qty })] });
+  const rulesFor = (l: Leg) => (l.venue === "Kraken" ? coarse : fine);
+  assert.deepEqual(checkTrade(trade(0.12345678), rulesFor), { qtys: [0.1234, 0.1234], problem: null });
+  assert.match(checkTrade(trade(0.00059524), rulesFor).problem!, /Lot sizes on Kraken and Coinbase would cut the order by over 1%/);
+  assert.match(checkTrade(trade(1.9), (l) => (l.venue === "Kraken" ? { ...fine, lot: 0.5 } : { ...fine, lot: 0.2 })).problem!, /don't divide into a common order size/);
+  assert.deepEqual(checkTrade(trade(0.1), () => undefined), { qtys: [0.1, 0.1], problem: null });
+  // Triangle legs are in different assets, so each keeps its own size.
+  const triangle = { kind: "triangle" as const, legs: [leg({ qty: 0.12345678 }), leg({ venue: "Coinbase", qty: 2.5 })] };
+  assert.deepEqual(checkTrade(triangle, rulesFor).qtys, [0.1234, 2.5]);
 });
 
 test("a leg is refused below the exchange's minimums or when its lot would unbalance the trade", () => {

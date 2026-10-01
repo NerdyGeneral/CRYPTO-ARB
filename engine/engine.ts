@@ -7,7 +7,7 @@ import { sendInParallel } from "../lib/execution";
 import { feeKey, supportedPair, symbols, type Quote, type Venue } from "../lib/market";
 import { keyOf, usdMarket, type Market } from "../lib/markets";
 import { barrierKey, blockReason, chooseTrade, indexRoutes, scanMarket, scanOpportunities, type Opportunity, type Rate, type RouteIndex, type TradeMemory } from "../lib/opportunities";
-import { checkLeg, coinbaseCreateOrder, krakenAddOrder } from "../lib/orders";
+import { checkTrade, coinbaseCreateOrder, krakenAddOrder } from "../lib/orders";
 import { fillLeg, LatencyTracker, settle, type LegFill } from "../lib/shadow";
 import { coinbaseJwt, krakenSignature } from "../lib/signing";
 import { connectStreams } from "../lib/streams";
@@ -546,15 +546,10 @@ export class Engine {
     return quote && Date.now() - quote.receivedAt <= QUOTE_TTL_MS ? quote : undefined;
   }
 
-  // Replays a paper trade as the real orders would have landed: each leg is checked against its book one
-  // round trip (plus decision time) after the decision, and anything left over is unwound one round trip later.
-  // A leg the exchange would reject, judged from its published order rules (Coinbase and Kraken).
+  // A leg the exchange would reject, judged from its published order rules (Coinbase and Kraken), or a
+  // cross-exchange trade whose two sides can't be rounded to the same size.
   private orderProblem(o: Opportunity): string | null {
-    for (const leg of o.legs) {
-      const problem = checkLeg(leg, this.marketByKey.get(leg.market)?.rules).problem;
-      if (problem) return problem;
-    }
-    return null;
+    return checkTrade(o, (leg) => this.marketByKey.get(leg.market)?.rules).problem;
   }
 
   // Replays the legs as sent together: each reaches its exchange one round trip (plus the decision and order
